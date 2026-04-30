@@ -1,89 +1,111 @@
 import cv2
+from scanner import Scanner
+from tracker import Tracker
 from vision import (
     detect_track_mask,
     skeletonize_mask,
     get_skeleton_points,
-    get_path_directions,
     get_follow_direction_from_position,
-    draw_skeleton,
-    draw_path_directions,
-    draw_follow_direction,
+    draw_debug,
 )
-from drone_controller import direction_to_command, DroneController
+from drone_controller import DroneController
 
-IMAGE_PATH = "track.jpeg"
-DRONE_POSITION = (430, 560)
+FLY = True
+DISPLAY = True
 
-img = cv2.imread(IMAGE_PATH)
+MAX_JUMP = 30
+LOOKAHEAD_DISTANCE = 120
+MAX_SEGMENT_GAP = 35
 
-if img is None:
-    print("Could not load image.")
-    exit(1)
+END_MARGIN_POINTS = 80
+END_CONFIRM_FRAMES = 10
 
-mask = detect_track_mask(img)
-skeleton = skeletonize_mask(mask)
-points = get_skeleton_points(skeleton, max_jump=30)
+LOST_CONFIRM_FRAMES = 60
+WARMUP_FRAMES = 30
 
-follow_direction = get_follow_direction_from_position(
-    DRONE_POSITION,
-    points,
-    lookahead_distance=120
-)
-
-if follow_direction is None:
-    print("No follow direction found.")
-    directions = []
-    commands = []
-    nearest_index = None
-    path_from_drone = []
-else:
-    nearest_index = follow_direction["nearest_index"]
-    path_from_drone = points[nearest_index:]
-
-    directions = get_path_directions(
-        path_from_drone,
-        step=80,
-        lookahead_distance=100
+def main():
+    scanner = Scanner()
+    tracker = Tracker(
+        floor_depth_mm=1800,
+        min_height_above_floor_mm=150,
+        min_depth_mm=200,
+        min_area=250,
+        max_area=30000
     )
-
-    commands = [direction_to_command(direction) for direction in directions]
-
-if len(commands) > 0:
     controller = DroneController()
 
+    end_counter = 0
+    lost_counter = 0
+
     try:
+        scanner.start()
+
+        for _ in range(WARMUP_FRAMES):
+            scanner.get_frames()
+
         controller.connect()
         controller.takeoff()
-        controller.follow_commands(commands)
-        controller.land()
-    except BaseException as e:
-        print("Drone flight failed:", e)
+
+        while True:
+            color_image, depth_image = scanner.get_frames()
+
+            if color_image is None or depth_image is None:
+                continue
+
+            drone_position, drone_mask = tracker.get_drone_position(depth_image)
+
+            track_mask = detect_track_mask(color_image)
+            skeleton = skeletonize_mask(track_mask)
+            points = get_skeleton_points(skeleton, max_jump=MAX_JUMP)
+
+            follow_direction = get_follow_direction_from_position(
+                drone_position,
+                points,
+                lookahead_distance=LOOKAHEAD_DISTANCE,
+                max_segment_gap=MAX_SEGMENT_GAP
+            )
+
+            if follow_direction is not None:
+                lost_counter = 0
+
+                nearest_index = follow_direction["nearest_index"]
+
+                if len(points) - nearest_index <= END_MARGIN_POINTS:
+                    end_counter += 1
+                else:
+                    end_counter = 0
+
+                controller.send_direction(follow_direction)
+            else:
+                lost_counter += 1
+                end_counter = 0
+                controller.hover()
+
+            if DISPLAY:
+                debug = draw_debug(color_image, track_mask, skeleton, drone_position, follow_direction)
+                cv2.imshow("debug", debug)
+                cv2.imshow("track mask", track_mask)
+                cv2.imshow("drone mask", drone_mask)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+
+            if end_counter >= END_CONFIRM_FRAMES:
+                break
+
+            if lost_counter >= LOST_CONFIRM_FRAMES:
+                break
+
+    except KeyboardInterrupt:
+        pass
+
     finally:
-        try:
-            controller.close()
-        except BaseException:
-            pass
-else:
-    print("No commands generated, skipping flight.")
+        controller.close()
+        scanner.stop()
 
-print("skeleton points:", len(points))
-print("nearest index:", nearest_index)
-print("path points from drone:", len(path_from_drone))
-print("directions:", len(directions))
-print("commands:")
-for i, command in enumerate(commands, start=1):
-    print(i, command)
+        if DISPLAY:
+            cv2.destroyAllWindows()
 
-debug = draw_skeleton(img, skeleton)
-debug = draw_path_directions(debug, directions)
-
-if follow_direction is not None:
-    debug = draw_follow_direction(debug, DRONE_POSITION, follow_direction)
-
-cv2.imshow("original", img)
-cv2.imshow("track mask", mask)
-cv2.imshow("skeleton", skeleton)
-cv2.imshow("debug follow", debug)
-
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()

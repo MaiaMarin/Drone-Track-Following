@@ -99,87 +99,8 @@ def get_skeleton_points(skeleton, max_jump=30):
 
     return ordered
 
-def draw_skeleton(img, skeleton):
-    debug = img.copy()
-
-    ys, xs = np.where(skeleton > 0)
-
-    for x, y in zip(xs, ys):
-        cv2.circle(debug, (x, y), 1, (0, 0, 255), -1)
-
-    return debug
-
-def get_lookahead_direction_from_index(points, start_index, lookahead_distance=100, max_segment_gap=35):
-    if len(points) < 2 or start_index >= len(points) - 1:
-        return None
-
-    start = points[start_index]
-    accumulated = 0
-
-    for i in range(start_index + 1, len(points)):
-        prev = np.array(points[i - 1])
-        curr = np.array(points[i])
-        segment_length = np.linalg.norm(curr - prev)
-
-        if segment_length > max_segment_gap:
-            return None
-
-        accumulated += segment_length
-
-        if accumulated >= lookahead_distance:
-            target = points[i]
-            break
-    else:
-        target = points[-1]
-
-    direction = np.array(target, dtype=np.float32) - np.array(start, dtype=np.float32)
-    norm = np.linalg.norm(direction)
-
-    if norm == 0:
-        return None
-
-    direction = direction / norm
-
-    return {
-        "start": start,
-        "target": target,
-        "dx": float(direction[0]),
-        "dy": float(direction[1])
-    }
-
-def get_path_directions(points, step=80, lookahead_distance=100):
-    directions = []
-
-    if len(points) < 2:
-        return directions
-
-    for start_index in range(0, len(points), step):
-        direction = get_lookahead_direction_from_index(
-            points,
-            start_index,
-            lookahead_distance=lookahead_distance
-        )
-
-        if direction is not None:
-            directions.append(direction)
-
-    return directions
-
-def draw_path_directions(img, directions):
-    debug = img.copy()
-
-    for direction in directions:
-        start = direction["start"]
-        target = direction["target"]
-
-        cv2.circle(debug, start, 5, (255, 0, 0), -1)
-        cv2.circle(debug, target, 5, (0, 255, 255), -1)
-        cv2.arrowedLine(debug, start, target, (0, 255, 0), 2, tipLength=0.3)
-
-    return debug
-
 def get_follow_direction_from_position(position, points, lookahead_distance=120, max_segment_gap=35):
-    if len(points) < 2:
+    if position is None or len(points) < 2:
         return None
 
     position_array = np.array(position, dtype=np.float32)
@@ -193,8 +114,8 @@ def get_follow_direction_from_position(position, points, lookahead_distance=120,
     accumulated = 0
 
     for i in range(nearest_index + 1, len(points)):
-        prev = np.array(points[i - 1])
-        curr = np.array(points[i])
+        prev = np.array(points[i - 1], dtype=np.float32)
+        curr = np.array(points[i], dtype=np.float32)
         segment_length = np.linalg.norm(curr - prev)
 
         if segment_length > max_segment_gap:
@@ -225,21 +146,26 @@ def get_follow_direction_from_position(position, points, lookahead_distance=120,
         "nearest_index": nearest_index
     }
 
-def draw_follow_direction(img, position, direction):
-    debug = img.copy()
+def draw_debug(color_image, track_mask, skeleton, drone_position, follow_direction):
+    debug = color_image.copy()
 
-    cv2.circle(debug, position, 8, (255, 0, 255), -1)
+    ys, xs = np.where(skeleton > 0)
+    for x, y in zip(xs, ys):
+        cv2.circle(debug, (x, y), 1, (0, 0, 255), -1)
 
-    if direction is None:
-        return debug
+    if drone_position is not None:
+        cv2.circle(debug, drone_position, 8, (255, 0, 255), -1)
 
-    nearest = direction["nearest"]
-    target = direction["target"]
+    if follow_direction is not None:
+        nearest = follow_direction["nearest"]
+        target = follow_direction["target"]
 
-    cv2.circle(debug, nearest, 7, (255, 255, 0), -1)
-    cv2.circle(debug, target, 9, (0, 255, 255), -1)
+        cv2.circle(debug, nearest, 7, (255, 255, 0), -1)
+        cv2.circle(debug, target, 9, (0, 255, 255), -1)
+        cv2.line(debug, drone_position, nearest, (255, 255, 0), 2)
+        cv2.arrowedLine(debug, drone_position, target, (0, 255, 255), 3, tipLength=0.3)
 
-    cv2.line(debug, position, nearest, (255, 255, 0), 2)
-    cv2.arrowedLine(debug, position, target, (0, 255, 255), 3, tipLength=0.3)
+        text = f"dx={follow_direction['dx']:.2f}, dy={follow_direction['dy']:.2f}"
+        cv2.putText(debug, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
     return debug

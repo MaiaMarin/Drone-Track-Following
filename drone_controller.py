@@ -1,12 +1,11 @@
 from codrone_edu.drone import Drone
 import time
 
-FORWARD_PITCH = 10
-ROLL_SCALE = 25
-MAX_ROLL = 25
-
-MOVE_DURATION = 0.45
-PAUSE_DURATION = 0.05
+FORWARD_PITCH = 8
+ROLL_SCALE = 22
+MAX_ROLL = 18
+MOVE_DURATION = 0.10
+PAUSE_DURATION = 0.02
 
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
@@ -59,21 +58,30 @@ class DroneController:
         self.drone.set_throttle(0)
         self.drone.move(PAUSE_DURATION)
 
-    def follow_commands(self, commands):
-        for command in commands:
-            self.send_command(command)
+    def send_direction(self, direction):
+        command = direction_to_command(direction)
+        self.send_command(command)
 
-    def land(self):
+    def hover(self):
         self.drone.set_roll(0)
         self.drone.set_pitch(0)
         self.drone.set_yaw(0)
         self.drone.set_throttle(0)
-        self.drone.move(0.2)
+        self.drone.move(0.10)
+
+    def land(self):
+        if not self.is_flying:
+            return
+
+        self.hover()
         self.drone.land()
         time.sleep(2)
         self.is_flying = False
 
     def close(self):
-        if self.is_flying:
-            self.land()
-        self.drone.close()
+        try:
+            if self.is_flying:
+                self.land()
+            self.drone.close()
+        except BaseException:
+            pass
