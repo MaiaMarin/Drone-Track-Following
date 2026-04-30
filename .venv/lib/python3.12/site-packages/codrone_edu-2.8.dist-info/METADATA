@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: codrone_edu
+Version: 2.8
+Summary: Python CoDrone EDU library
+Home-page: 
+Author: 
+Author-email: 
+Requires-Python: >=3.5
+Requires-Dist: pyserial>=3.5
+Requires-Dist: numpy
+Requires-Dist: colorama
+Requires-Dist: Pillow
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
