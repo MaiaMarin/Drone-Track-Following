@@ -39,8 +39,8 @@ import time
 # sign +1 = same direction, -1 = invert.
 
 AXIS_MAP = {
-    "roll":  ("dx",  1),
-    "pitch": ("dy", -1),
+    "roll":  ("dx",  -1),
+    "pitch": ("dy", 1),
 }
 
 # if the camera is nearly side-on and camera_dy doesn't encode forward progress,
@@ -50,7 +50,7 @@ CONSTANT_FORWARD_PITCH = None
 
 # ── altitude (bottom range sensor) ───────────────────────────────────────────
 
-TARGET_ALTITUDE_CM   = 30     # 30 cm as specified
+TARGET_ALTITUDE_CM   = 10     # 30 cm as specified
 ALTITUDE_DEADBAND_CM = 3      # tolerated error before throttle kicks in
 ALTITUDE_KP          = 0.8    # proportional gain (cm error -> throttle units)
 MAX_THROTTLE         = 30
@@ -64,10 +64,10 @@ FRONT_STOP_CM        = 15     # if closer than this, stop pitching entirely
 
 # ── movement ──────────────────────────────────────────────────────────────────
 
-ROLL_SCALE           = 35     # scale normalised dx to roll units
-PITCH_SCALE          = 20
-MAX_ROLL             = 40
-MAX_PITCH            = 25
+ROLL_SCALE           = 15     # scale normalised dx to roll units
+PITCH_SCALE          = 10
+MAX_ROLL             = 20
+MAX_PITCH            = 15
 
 MOVE_DURATION        = 0.05   # seconds per cycle
 
@@ -116,6 +116,17 @@ class TrackController:
         altitude and front obstacle distance are read directly from the
         drone's own sensors inside this method.
         """
+            # emergency land if q is pressed
+        import cv2
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            print("emergency land triggered.")
+            self._land()
+            return
+
+        if not self._is_flying:
+            return
+    
         if not self._is_flying:
             return
 
@@ -124,7 +135,7 @@ class TrackController:
         front_cm     = self.drone.get_front_range()    # cm to nearest obstacle ahead
 
         # ── landing check ─────────────────────────────────────────────────────
-        if landing_detected:
+        if landing_detected and drone_pos is not None and drone_pos[0] > 500:
             self._landing_counter += 1
             print(f"landing pad visible {self._landing_counter}/{LANDING_PAD_FRAMES}")
             if self._landing_counter >= LANDING_PAD_FRAMES:
@@ -207,7 +218,6 @@ class TrackController:
 # update AXIS_MAP at the top of this file accordingly.
 
 if __name__ == "__main__":
-    import pyrealsense2 as rs
     import numpy as np
     import cv2
     from vision import (
@@ -216,21 +226,36 @@ if __name__ == "__main__":
         draw_debug, detect_yellow_landing,
     )
 
-    pipeline = rs.pipeline()
-    cfg      = rs.config()
-    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    pipeline.start(cfg)
+    IMAGE_PATH = "track.jpeg"
 
-    print("calibration mode — move the drone by hand. press q to quit.")
+    img = cv2.imread(IMAGE_PATH)
+    if img is None:
+        print(f"could not read {IMAGE_PATH}")
+        exit(1)
+
+    # resize to match what the camera would send
+    max_width = 900
+    h, w = img.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        img = cv2.resize(img, (max_width, int(h * scale)))
+
+    print("static image mode — press q to quit, drone commands will print but not fly.")
+    print("pair your drone first? (y/n): ", end="")
+    do_pair = input().strip().lower() == "y"
+
+    controller = TrackController()
+    if do_pair:
+        controller.connect()  # takeoff happens here — careful!
+    else:
+        controller.drone.pair()
+        import time
+        time.sleep(2)
+        controller._is_flying = True
+        print("paired without takeoff — commands will be sent but drone stays grounded.")
 
     try:
         while True:
-            frames = pipeline.wait_for_frames()
-            cf = frames.get_color_frame()
-            if not cf:
-                continue
-
-            img       = np.asanyarray(cf.get_data())
             mask      = detect_track_mask(img)
             skeleton  = get_track_skeleton(mask)
             drone_pos = detect_drone_position(img)
@@ -238,13 +263,17 @@ if __name__ == "__main__":
             _, land   = detect_yellow_landing(img)
 
             if direction:
-                print(f"  dx: {direction[0]:+.3f}   dy: {direction[1]:+.3f}", end="\r")
+                print(f"dx: {direction[0]:+.3f}  dy: {direction[1]:+.3f}", end="  ")
 
-            cv2.imshow("calibration", draw_debug(img, skeleton, drone_pos, direction, land))
+            # print what would be sent instead of actually flying
+            controller.update(direction, land)
+
+            cv2.imshow("static calibration", draw_debug(img, skeleton, drone_pos, direction, land))
             cv2.imshow("track mask", mask)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            if cv2.waitKey(30) & 0xFF == ord("q"):
                 break
     finally:
-        pipeline.stop()
+        controller._is_flying = False  # skip auto-land on exit
+        controller.drone.close()
         cv2.destroyAllWindows()
