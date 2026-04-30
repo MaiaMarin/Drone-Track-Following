@@ -44,7 +44,11 @@ try:
             continue
 
         img = np.asanyarray(color_frame.get_data())
-
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            print("emergency land.")
+            controller._land()
+            break
         # ── vision ────────────────────────────────────────────────────────────
         track_mask       = detect_track_mask(img)
         skeleton         = get_track_skeleton(track_mask)
@@ -53,7 +57,7 @@ try:
         _, landing       = detect_yellow_landing(img)
 
         # ── movement (sensors read inside update()) ───────────────────────────
-        controller.update(direction_result, landing)
+        controller.update(direction_result, landing, drone_pos)
 
         # ── debug display ─────────────────────────────────────────────────────
         debug = draw_debug(img, skeleton, drone_pos, direction_result, landing)

@@ -39,8 +39,8 @@ import time
 # sign +1 = same direction, -1 = invert.
 
 AXIS_MAP = {
-    "roll":  ("dx",  -1),
-    "pitch": ("dy", 1),
+    "roll":  ("dy",  1),
+    "pitch": ("dx", 1),
 }
 
 # if the camera is nearly side-on and camera_dy doesn't encode forward progress,
@@ -53,7 +53,7 @@ CONSTANT_FORWARD_PITCH = None
 TARGET_ALTITUDE_CM   = 10     # 30 cm as specified
 ALTITUDE_DEADBAND_CM = 3      # tolerated error before throttle kicks in
 ALTITUDE_KP          = 0.8    # proportional gain (cm error -> throttle units)
-MAX_THROTTLE         = 30
+MAX_THROTTLE         = 10
 
 
 # ── front range safety brake ──────────────────────────────────────────────────
@@ -64,10 +64,10 @@ FRONT_STOP_CM        = 15     # if closer than this, stop pitching entirely
 
 # ── movement ──────────────────────────────────────────────────────────────────
 
-ROLL_SCALE           = 15     # scale normalised dx to roll units
-PITCH_SCALE          = 10
-MAX_ROLL             = 20
-MAX_PITCH            = 15
+ROLL_SCALE           = 35     # scale normalised dx to roll units
+PITCH_SCALE          = 20
+MAX_ROLL             = 40
+MAX_PITCH            = 25
 
 MOVE_DURATION        = 0.05   # seconds per cycle
 
@@ -116,17 +116,6 @@ class TrackController:
         altitude and front obstacle distance are read directly from the
         drone's own sensors inside this method.
         """
-            # emergency land if q is pressed
-        import cv2
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            print("emergency land triggered.")
-            self._land()
-            return
-
-        if not self._is_flying:
-            return
-    
         if not self._is_flying:
             return
 
