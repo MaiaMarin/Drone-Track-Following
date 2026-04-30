@@ -1,70 +1,54 @@
-"""
-main.py
--------
-main flight loop. uses only the realsense colour stream —
-depth is not needed because the drone reads its own altitude via the
-bottom range sensor inside movement_controller.update().
-"""
-
-import pyrealsense2 as rs
-import numpy as np
 import cv2
-
 from vision import (
     detect_track_mask,
-    get_track_skeleton,
-    detect_drone_position,
-    get_lookahead_direction,
-    draw_debug,
-    detect_yellow_landing,
+    skeletonize_mask,
+    get_skeleton_points,
+    get_path_directions,
+    get_follow_direction_from_position,
 )
-from movement_controller import TrackController
+from drone_controller import direction_to_command, DroneController
 
+IMAGE_PATH = "track.jpeg"
+DRONE_POSITION = (430, 560)
 
-# ── realsense — colour only ───────────────────────────────────────────────────
+img = cv2.imread(IMAGE_PATH)
 
-pipeline = rs.pipeline()
-config   = rs.config()
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-# depth stream is not enabled here; altitude comes from drone.get_bottom_range()
+if img is None:
+    exit(1)
 
+mask = detect_track_mask(img)
+skeleton = skeletonize_mask(mask)
+points = get_skeleton_points(skeleton, max_jump=30)
 
-# ── main ──────────────────────────────────────────────────────────────────────
+follow_direction = get_follow_direction_from_position(
+    DRONE_POSITION,
+    points,
+    lookahead_distance=120
+)
 
-controller = TrackController()
+if follow_direction is None:
+    exit(1)
+
+nearest_index = follow_direction["nearest_index"]
+path_from_drone = points[nearest_index:]
+
+directions = get_path_directions(
+    path_from_drone,
+    step=80,
+    lookahead_distance=100
+)
+
+commands = [direction_to_command(direction) for direction in directions]
+
+if len(commands) == 0:
+    exit(1)
+
+controller = DroneController()
 
 try:
-    pipeline.start(config)
     controller.connect()
-
-    while True:
-        frames      = pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            continue
-
-        img = np.asanyarray(color_frame.get_data())
-
-        # ── vision ────────────────────────────────────────────────────────────
-        track_mask       = detect_track_mask(img)
-        skeleton         = get_track_skeleton(track_mask)
-        drone_pos        = detect_drone_position(img)
-        direction_result = get_lookahead_direction(drone_pos, skeleton)
-        _, landing       = detect_yellow_landing(img)
-
-        # ── movement (sensors read inside update()) ───────────────────────────
-        controller.update(direction_result, landing)
-
-        # ── debug display ─────────────────────────────────────────────────────
-        debug = draw_debug(img, skeleton, drone_pos, direction_result, landing)
-        cv2.imshow("track follower", debug)
-        cv2.imshow("track mask",     track_mask)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("manual quit.")
-            break
-
+    controller.takeoff()
+    controller.follow_commands(commands)
+    controller.land()
 finally:
-    controller.disconnect()
-    pipeline.stop()
-    cv2.destroyAllWindows()
+    controller.close()
