@@ -29,6 +29,17 @@ def resize_depth(depth, shape):
 
     return cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
 
+def resize_mask(mask, shape):
+    h, w = shape
+
+    if mask is None:
+        return np.zeros((h, w), dtype=bool)
+
+    if mask.shape[:2] == (h, w):
+        return mask.astype(bool)
+
+    return cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
 def clean_mask(mask, open_k=3, close_k=7):
     mask = mask.astype(np.uint8)
 
@@ -74,11 +85,28 @@ def make_floor_roi(bgr):
     yy, xx = np.indices((h, w))
 
     roi = yy > int(0.16 * h)
-    roi &= yy < int(0.97 * h)
+    roi &= yy < int(0.98 * h)
     roi &= xx > int(0.01 * w)
     roi &= xx < int(0.99 * w)
 
     return roi
+
+def point_mask(shape, center, radius=55):
+    h, w = shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    if center is None:
+        return mask.astype(bool)
+
+    x = int(round(center[0]))
+    y = int(round(center[1]))
+
+    x = int(np.clip(x, 0, w - 1))
+    y = int(np.clip(y, 0, h - 1))
+
+    cv2.circle(mask, (x, y), radius, 1, -1)
+
+    return mask.astype(bool)
 
 def detect_landing_pad(bgr, roi):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -90,12 +118,12 @@ def detect_landing_pad(bgr, roi):
 
     mask = (
         roi &
-        (xx < int(0.48 * w)) &
-        (hue >= 85) & (hue <= 105) &
-        (sat >= 55) &
-        (val >= 70) &
-        (blue.astype(np.int16) - red.astype(np.int16) > 35) &
-        (green.astype(np.int16) - red.astype(np.int16) > 25)
+        (xx < int(0.50 * w)) &
+        (hue >= 82) & (hue <= 110) &
+        (sat >= 45) &
+        (val >= 60) &
+        (blue.astype(np.int16) - red.astype(np.int16) > 25) &
+        (green.astype(np.int16) - red.astype(np.int16) > 15)
     )
 
     mask = clean_mask(mask, open_k=5, close_k=13)
@@ -104,18 +132,18 @@ def detect_landing_pad(bgr, roi):
     candidates = []
 
     for comp in comps:
-        if comp["area"] < 400:
+        if comp["area"] < 250:
             continue
-        if comp["area"] > 15000:
+        if comp["area"] > 18000:
             continue
-        if comp["w"] < 25 or comp["h"] < 20:
+        if comp["w"] < 20 or comp["h"] < 15:
             continue
-        if comp["w"] > 180 or comp["h"] > 120:
+        if comp["w"] > 220 or comp["h"] > 160:
             continue
-        if comp["fill"] < 0.20:
+        if comp["fill"] < 0.15:
             continue
 
-        score = comp["area"] * comp["fill"]
+        score = comp["area"] * comp["fill"] + (1.0 - comp["cx"] / max(w, 1)) * 400
         candidates.append((score, comp))
 
     if not candidates:
@@ -140,21 +168,19 @@ def detect_start_pad(bgr, roi):
 
     raw = (
         roi &
-        (xx > int(0.70 * w)) &
-        (xx < int(0.95 * w)) &
-        (yy > int(0.15 * h)) &
-        (yy < int(0.50 * h)) &
-        (hue >= 65) & (hue <= 105) &
-        (sat >= 12) & (sat <= 120) &
-        (val >= 70) &
-        (green.astype(np.int16) - red.astype(np.int16) > 2) &
-        (blue.astype(np.int16) - red.astype(np.int16) > -10)
+        (xx > int(0.48 * w)) &
+        (yy > int(0.25 * h)) &
+        (hue >= 55) & (hue <= 110) &
+        (sat >= 12) & (sat <= 160) &
+        (val >= 45) &
+        (green.astype(np.int16) - red.astype(np.int16) > 0) &
+        (blue.astype(np.int16) - red.astype(np.int16) > -25)
     )
 
     raw = cv2.morphologyEx(
         raw.astype(np.uint8),
         cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     )
 
     raw = cv2.morphologyEx(
@@ -167,10 +193,30 @@ def detect_start_pad(bgr, roi):
     candidates = []
 
     for comp in comps:
-        if comp["area"] < 500:
+        if comp["area"] < 120:
+            continue
+        if comp["area"] > 18000:
+            continue
+        if comp["w"] > 240 or comp["h"] > 180:
+            continue
+        if comp["fill"] < 0.08:
             continue
 
-        score = comp["area"] + comp["cx"] * 2.0
+        cx_norm = comp["cx"] / max(w, 1)
+        cy_norm = comp["cy"] / max(h, 1)
+
+        component_mask = labels == comp["id"]
+        mean_b = float(np.mean(blue[component_mask]))
+        mean_g = float(np.mean(green[component_mask]))
+        mean_r = float(np.mean(red[component_mask]))
+
+        greenish = mean_g - mean_r
+        right_bonus = cx_norm * 700
+        floor_bonus = cy_norm * 250
+        area_bonus = min(comp["area"], 3000) * 0.6
+        fill_bonus = comp["fill"] * 400
+
+        score = area_bonus + right_bonus + floor_bonus + fill_bonus + greenish * 8
         candidates.append((score, comp))
 
     pad = np.zeros((h, w), dtype=np.uint8)
@@ -180,7 +226,7 @@ def detect_start_pad(bgr, roi):
         candidates.sort(key=lambda x: x[0], reverse=True)
         best = candidates[0][1]
         center = [best["cx"], best["cy"]]
-        cv2.circle(pad, (int(best["cx"]), int(best["cy"])), 45, 1, -1)
+        cv2.circle(pad, (int(best["cx"]), int(best["cy"])), 55, 1, -1)
 
     pad = pad.astype(bool)
 
@@ -191,22 +237,22 @@ def build_track_score(bgr, roi):
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-    hue, sat, val = cv2.split(hsv)
     blue, green, red = cv2.split(bgr)
     lightness = lab[:, :, 0]
+    _, sat, val = cv2.split(hsv)
 
     blur = cv2.GaussianBlur(lightness, (0, 0), 25)
     local_bright = lightness.astype(np.int16) - blur.astype(np.int16)
 
     beige = (
         roi &
-        (val >= 80) &
-        (sat <= 120) &
-        (red >= 65) &
-        (green >= 60) &
-        (blue >= 50) &
-        (np.abs(red.astype(np.int16) - green.astype(np.int16)) < 75) &
-        (np.abs(green.astype(np.int16) - blue.astype(np.int16)) < 95)
+        (val >= 70) &
+        (sat <= 130) &
+        (red >= 55) &
+        (green >= 50) &
+        (blue >= 40) &
+        (np.abs(red.astype(np.int16) - green.astype(np.int16)) < 85) &
+        (np.abs(green.astype(np.int16) - blue.astype(np.int16)) < 105)
     )
 
     edges = cv2.Canny(gray, 55, 135)
@@ -336,94 +382,6 @@ def path_to_mask(path, shape, thickness=40):
 
     return mask > 0
 
-def detect_drone_led(bgr, roi, path_mask, landing_pad):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-    h, w = bgr.shape[:2]
-    hue, sat, val = cv2.split(hsv)
-    blue, green, red = cv2.split(bgr)
-
-    exclude = cv2.dilate(
-        landing_pad.astype(np.uint8),
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (85, 85)),
-        iterations=1
-    ).astype(bool)
-
-    bright = (
-        roi &
-        ~exclude &
-        (
-            ((val >= 160) & (sat <= 180)) |
-            ((blue >= 140) & (green >= 120) & (red >= 80) & (val >= 135))
-        )
-    )
-
-    labels, comps = connected_components(bright)
-
-    distmap = None
-
-    if path_mask is not None and np.count_nonzero(path_mask) > 0:
-        inv = (~path_mask).astype(np.uint8) * 255
-        distmap = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
-
-    candidates = []
-
-    for comp in comps:
-        if comp["area"] < 4:
-            continue
-        if comp["area"] > 1500:
-            continue
-        if comp["w"] > 80 or comp["h"] > 80:
-            continue
-
-        cx = int(comp["cx"])
-        cy = int(comp["cy"])
-
-        r = 65
-        x1 = max(0, cx - r)
-        x2 = min(w, cx + r)
-        y1 = max(0, cy - r)
-        y2 = min(h, cy + r)
-
-        dark_fraction = float(np.mean(gray[y1:y2, x1:x2] < 95))
-        brightness = float(np.mean(val[labels == comp["id"]]))
-
-        score = brightness * 1.5 + dark_fraction * 200 + comp["area"] * 0.03
-
-        if distmap is not None:
-            score -= float(distmap[cy, cx]) * 1.2
-
-        comp["score"] = score
-        comp["dark_fraction"] = dark_fraction
-        comp["brightness"] = brightness
-
-        candidates.append(comp)
-
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-
-    drone_mask = np.zeros((h, w), dtype=np.uint8)
-    drone_center = None
-
-    if candidates and candidates[0]["score"] > 230:
-        best = candidates[0]
-        drone_center = [best["cx"], best["cy"]]
-        cv2.circle(drone_mask, (int(best["cx"]), int(best["cy"])), 42, 1, -1)
-
-    drone_mask = drone_mask.astype(bool)
-
-    debug = {
-        "drone_bright_candidates": bright,
-        "drone": drone_mask,
-    }
-
-    info = {
-        "drone_center": drone_center,
-        "drone_candidates": candidates[:5],
-    }
-
-    return drone_mask, info, debug
-
 def sample_depth(depth, point, radius=5):
     if depth is None or point is None:
         return None
@@ -445,6 +403,386 @@ def sample_depth(depth, point, radius=5):
 
     return float(np.median(values))
 
+def make_search_mask(shape, center, radius):
+    h, w = shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    if center is None:
+        return mask.astype(bool)
+
+    x = int(round(center[0]))
+    y = int(round(center[1]))
+    x = int(np.clip(x, 0, w - 1))
+    y = int(np.clip(y, 0, h - 1))
+
+    cv2.circle(mask, (x, y), radius, 1, -1)
+
+    return mask.astype(bool)
+
+def detect_drone_led(bgr, roi, path_mask, landing_pad, start_pad, depth=None, previous_center=None):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    h, w = bgr.shape[:2]
+    depth = resize_depth(depth, (h, w))
+
+    _, sat, val = cv2.split(hsv)
+    blue, green, red = cv2.split(bgr)
+
+    exclude_landing = cv2.dilate(
+        landing_pad.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (95, 95)),
+        iterations=1
+    ).astype(bool)
+
+    exclude_start = cv2.dilate(
+        start_pad.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (95, 95)),
+        iterations=1
+    ).astype(bool)
+
+    exclude = exclude_landing | exclude_start
+    allowed = roi & ~exclude
+
+    if previous_center is not None:
+        allowed &= make_search_mask((h, w), previous_center, 260)
+
+    white_led = (val >= 165) & (sat <= 180)
+
+    bluish_led = (
+        (blue >= 115) &
+        (green >= 90) &
+        (red >= 55) &
+        (val >= 115)
+    )
+
+    reddish_led = (
+        (red >= 120) &
+        (val >= 120) &
+        (sat >= 45) &
+        (blue < 140)
+    )
+
+    bright = allowed & (white_led | bluish_led | reddish_led)
+
+    labels, comps = connected_components(bright)
+
+    distmap = None
+
+    if path_mask is not None and np.count_nonzero(path_mask) > 0:
+        inv = (~path_mask).astype(np.uint8) * 255
+        distmap = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+
+    previous_distmap = None
+
+    if previous_center is not None:
+        prev_mask = make_search_mask((h, w), previous_center, 1).astype(np.uint8)
+        previous_distmap = cv2.distanceTransform((1 - prev_mask).astype(np.uint8), cv2.DIST_L2, 5)
+
+    scene_depth = None
+
+    if depth is not None:
+        valid_depth = depth[(depth > 0) & roi]
+
+        if valid_depth.size > 0:
+            scene_depth = float(np.median(valid_depth))
+
+    candidates = []
+
+    for comp in comps:
+        if comp["area"] < 3:
+            continue
+        if comp["area"] > 1600:
+            continue
+        if comp["w"] > 90 or comp["h"] > 90:
+            continue
+
+        cx = int(comp["cx"])
+        cy = int(comp["cy"])
+
+        r = 75
+        x1 = max(0, cx - r)
+        x2 = min(w, cx + r)
+        y1 = max(0, cy - r)
+        y2 = min(h, cy + r)
+
+        local_gray = gray[y1:y2, x1:x2]
+        local_val = val[y1:y2, x1:x2]
+
+        dark_fraction = float(np.mean(local_gray < 90))
+        very_dark_fraction = float(np.mean(local_gray < 55))
+        bright_fraction = float(np.mean(local_val > 150))
+        brightness = float(np.mean(val[labels == comp["id"]]))
+
+        depth_score = 0.0
+        candidate_depth = sample_depth(depth, [cx, cy], radius=8)
+
+        if scene_depth is not None and candidate_depth is not None:
+            closer_amount = scene_depth - candidate_depth
+            depth_score = float(np.clip(closer_amount / 700.0, 0.0, 1.0)) * 220.0
+
+        score = 0.0
+        score += brightness * 1.15
+        score += dark_fraction * 260.0
+        score += very_dark_fraction * 240.0
+        score += bright_fraction * 80.0
+        score += depth_score
+        score += comp["area"] * 0.03
+
+        if distmap is not None:
+            score -= min(float(distmap[cy, cx]), 260.0) * 0.55
+
+        if previous_distmap is not None:
+            score -= min(float(previous_distmap[cy, cx]), 260.0) * 0.85
+
+        if dark_fraction < 0.08:
+            score -= 180.0
+
+        if candidate_depth is None and depth is not None:
+            score -= 40.0
+
+        comp["score"] = score
+        comp["dark_fraction"] = dark_fraction
+        comp["very_dark_fraction"] = very_dark_fraction
+        comp["bright_fraction"] = bright_fraction
+        comp["brightness"] = brightness
+        comp["depth"] = candidate_depth
+        comp["depth_score"] = depth_score
+
+        candidates.append(comp)
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    drone_mask = np.zeros((h, w), dtype=np.uint8)
+    drone_center = None
+
+    if candidates and candidates[0]["score"] > 210:
+        best = candidates[0]
+        drone_center = [best["cx"], best["cy"]]
+        cv2.circle(drone_mask, (int(best["cx"]), int(best["cy"])), 42, 1, -1)
+
+    drone_mask = drone_mask.astype(bool)
+
+    debug = {
+        "drone_bright_candidates": bright,
+        "drone": drone_mask,
+    }
+
+    info = {
+        "drone_center": drone_center,
+        "drone_candidates": candidates[:5],
+        "drone_method": "led",
+    }
+
+    return drone_mask, info, debug
+
+def detect_drone_motion(
+    bgr,
+    previous_bgr,
+    roi,
+    path_mask,
+    landing_pad,
+    start_pad,
+    depth=None,
+    previous_center=None,
+):
+    h, w = bgr.shape[:2]
+    depth = resize_depth(depth, (h, w))
+
+    if previous_bgr is None:
+        empty = np.zeros((h, w), dtype=bool)
+        info = {
+            "drone_center": None,
+            "drone_candidates": [],
+            "drone_method": "motion_unavailable",
+        }
+        debug = {
+            "drone_motion_raw": empty,
+            "drone_motion_clean": empty,
+            "drone": empty,
+        }
+        return empty, info, debug
+
+    if previous_bgr.shape[:2] != (h, w):
+        previous_bgr = cv2.resize(previous_bgr, (w, h), interpolation=cv2.INTER_AREA)
+
+    current_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    previous_gray = cv2.cvtColor(previous_bgr, cv2.COLOR_BGR2GRAY)
+
+    current_gray = cv2.GaussianBlur(current_gray, (7, 7), 0)
+    previous_gray = cv2.GaussianBlur(previous_gray, (7, 7), 0)
+
+    gray_diff = cv2.absdiff(current_gray, previous_gray)
+
+    color_diff = cv2.absdiff(bgr, previous_bgr)
+    color_diff = np.max(color_diff, axis=2)
+
+    motion_raw = ((gray_diff > 18) | (color_diff > 32))
+
+    allowed = roi.copy()
+
+    if previous_center is not None:
+        allowed &= make_search_mask((h, w), previous_center, 260)
+
+    near_path = np.zeros((h, w), dtype=bool)
+
+    if path_mask is not None and np.count_nonzero(path_mask) > 0:
+        near_path = cv2.dilate(
+            path_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (231, 231)),
+            iterations=1
+        ).astype(bool)
+
+    if previous_center is None and np.count_nonzero(near_path) > 0:
+        allowed &= near_path
+
+    if previous_center is not None and np.count_nonzero(near_path) > 0:
+        allowed &= (near_path | make_search_mask((h, w), previous_center, 260))
+
+    motion = motion_raw & allowed
+
+    motion = cv2.morphologyEx(
+        motion.astype(np.uint8),
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    )
+
+    motion = cv2.morphologyEx(
+        motion,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    )
+
+    motion = cv2.dilate(
+        motion,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=1
+    ).astype(bool)
+
+    labels, comps = connected_components(motion)
+
+    distmap = None
+
+    if path_mask is not None and np.count_nonzero(path_mask) > 0:
+        inv = (~path_mask).astype(np.uint8) * 255
+        distmap = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+
+    previous_distmap = None
+
+    if previous_center is not None:
+        prev_mask = make_search_mask((h, w), previous_center, 1).astype(np.uint8)
+        previous_distmap = cv2.distanceTransform((1 - prev_mask).astype(np.uint8), cv2.DIST_L2, 5)
+
+    scene_depth = None
+
+    if depth is not None:
+        valid_depth = depth[(depth > 0) & roi]
+
+        if valid_depth.size > 0:
+            scene_depth = float(np.median(valid_depth))
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    _, _, val = cv2.split(hsv)
+
+    candidates = []
+
+    for comp in comps:
+        if comp["area"] < 20:
+            continue
+        if comp["area"] > 14000:
+            continue
+        if comp["w"] > 220 or comp["h"] > 220:
+            continue
+
+        cx = int(comp["cx"])
+        cy = int(comp["cy"])
+
+        component_mask = labels == comp["id"]
+
+        x1 = max(0, comp["x"])
+        x2 = min(w, comp["x"] + comp["w"])
+        y1 = max(0, comp["y"])
+        y2 = min(h, comp["y"] + comp["h"])
+
+        local_gray = gray[y1:y2, x1:x2]
+        local_val = val[y1:y2, x1:x2]
+        local_motion = gray_diff[y1:y2, x1:x2]
+
+        dark_fraction = float(np.mean(local_gray < 95))
+        very_dark_fraction = float(np.mean(local_gray < 55))
+        bright_fraction = float(np.mean(local_val > 150))
+        motion_energy = float(np.mean(local_motion[motion[y1:y2, x1:x2]])) if np.any(motion[y1:y2, x1:x2]) else 0.0
+
+        depth_score = 0.0
+        candidate_depth = sample_depth(depth, [cx, cy], radius=8)
+
+        if scene_depth is not None and candidate_depth is not None:
+            closer_amount = scene_depth - candidate_depth
+            depth_score = float(np.clip(closer_amount / 700.0, 0.0, 1.0)) * 180.0
+
+        score = 0.0
+        score += min(comp["area"], 2500) * 0.06
+        score += motion_energy * 2.0
+        score += dark_fraction * 180.0
+        score += very_dark_fraction * 220.0
+        score += bright_fraction * 50.0
+        score += depth_score
+
+        if distmap is not None:
+            score -= min(float(distmap[cy, cx]), 260.0) * 0.30
+
+        if previous_distmap is not None:
+            score -= min(float(previous_distmap[cy, cx]), 300.0) * 0.75
+
+        if previous_center is not None:
+            d_prev = float(np.hypot(cx - previous_center[0], cy - previous_center[1]))
+            if d_prev > 260:
+                score -= 300.0
+
+        if comp["fill"] < 0.04:
+            score -= 70.0
+
+        if candidate_depth is None and depth is not None:
+            score -= 30.0
+
+        comp["score"] = score
+        comp["dark_fraction"] = dark_fraction
+        comp["very_dark_fraction"] = very_dark_fraction
+        comp["bright_fraction"] = bright_fraction
+        comp["motion_energy"] = motion_energy
+        comp["depth"] = candidate_depth
+        comp["depth_score"] = depth_score
+
+        candidates.append(comp)
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    drone_mask = np.zeros((h, w), dtype=np.uint8)
+    drone_center = None
+
+    if candidates and candidates[0]["score"] > 85:
+        best = candidates[0]
+        drone_center = [best["cx"], best["cy"]]
+        radius = int(np.clip(max(best["w"], best["h"]) * 0.75, 28, 55))
+        cv2.circle(drone_mask, (int(best["cx"]), int(best["cy"])), radius, 1, -1)
+
+    drone_mask = drone_mask.astype(bool)
+
+    debug = {
+        "drone_motion_raw": motion_raw,
+        "drone_motion_clean": motion,
+        "drone": drone_mask,
+    }
+
+    info = {
+        "drone_center": drone_center,
+        "drone_candidates": candidates[:5],
+        "drone_method": "motion",
+    }
+
+    return drone_mask, info, debug
+
 def segment_scene(bgr, depth=None, return_debug=False):
     h, w = bgr.shape[:2]
     depth = resize_depth(depth, (h, w))
@@ -459,7 +797,14 @@ def segment_scene(bgr, depth=None, return_debug=False):
     path = dijkstra_path(track_score, landing_center, start_center)
     track = path_to_mask(path, (h, w), thickness=max(24, int(round(min(h, w) * 0.055))))
 
-    drone, drone_info, drone_debug = detect_drone_led(bgr, roi, track, landing_pad)
+    drone, drone_info, drone_debug = detect_drone_led(
+        bgr,
+        roi,
+        track,
+        landing_pad,
+        start_pad,
+        depth=depth
+    )
 
     seg = np.zeros((h, w), dtype=np.uint8)
     seg[track] = TRACK
@@ -472,9 +817,14 @@ def segment_scene(bgr, depth=None, return_debug=False):
         "landing_pad_center": landing_center,
         "drone_center": drone_info["drone_center"],
         "path": path,
+        "track_mask": track,
+        "start_pad_mask": start_pad,
+        "landing_pad_mask": landing_pad,
         "start_depth": sample_depth(depth, start_center),
         "landing_depth": sample_depth(depth, landing_center),
         "drone_depth": sample_depth(depth, drone_info["drone_center"]),
+        "drone_candidates": drone_info["drone_candidates"],
+        "drone_method": drone_info.get("drone_method"),
     }
 
     if not return_debug:
@@ -486,6 +836,189 @@ def segment_scene(bgr, depth=None, return_debug=False):
         **start_debug,
         **track_debug,
         "track": track,
+        **drone_debug,
+    }
+
+    return seg, info, debug
+
+def build_fixed_scene(bgr, depth=None):
+    seg, info = segment_scene(bgr, depth, return_debug=False)
+
+    path = info.get("path") or []
+    track_mask = info.get("track_mask")
+
+    if track_mask is None:
+        track_mask = path_to_mask(
+            path,
+            bgr.shape[:2],
+            thickness=max(24, int(round(min(bgr.shape[:2]) * 0.055)))
+        )
+
+    fixed_scene = {
+        "path": path,
+        "track_mask": track_mask,
+        "start_pad_center": info.get("start_pad_center"),
+        "landing_pad_center": info.get("landing_pad_center"),
+        "start_pad_mask": info.get("start_pad_mask"),
+        "landing_pad_mask": info.get("landing_pad_mask"),
+        "initial_drone_center": info.get("drone_center"),
+        "shape": bgr.shape[:2],
+    }
+
+    return fixed_scene
+
+def build_fixed_scene_from_points(
+    bgr,
+    depth=None,
+    start_center=None,
+    landing_center=None,
+    initial_drone_center=None,
+    start_radius=55,
+    landing_radius=55,
+):
+    h, w = bgr.shape[:2]
+    depth = resize_depth(depth, (h, w))
+
+    if start_center is None or landing_center is None:
+        raise ValueError("Both start_center and landing_center are required.")
+
+    start_center = [float(start_center[0]), float(start_center[1])]
+    landing_center = [float(landing_center[0]), float(landing_center[1])]
+
+    if initial_drone_center is not None:
+        initial_drone_center = [float(initial_drone_center[0]), float(initial_drone_center[1])]
+
+    roi = make_floor_roi(bgr)
+    track_score, _ = build_track_score(bgr, roi)
+
+    path = dijkstra_path(track_score, landing_center, start_center)
+
+    track_mask = path_to_mask(
+        path,
+        (h, w),
+        thickness=max(24, int(round(min(h, w) * 0.055)))
+    )
+
+    start_pad_mask = point_mask((h, w), start_center, radius=start_radius)
+    landing_pad_mask = point_mask((h, w), landing_center, radius=landing_radius)
+
+    if initial_drone_center is None:
+        _, drone_info, _ = detect_drone_led(
+            bgr,
+            roi,
+            track_mask,
+            landing_pad_mask,
+            start_pad_mask,
+            depth=depth
+        )
+        initial_drone_center = drone_info["drone_center"]
+
+    fixed_scene = {
+        "path": path,
+        "track_mask": track_mask,
+        "start_pad_center": start_center,
+        "landing_pad_center": landing_center,
+        "start_pad_mask": start_pad_mask,
+        "landing_pad_mask": landing_pad_mask,
+        "initial_drone_center": initial_drone_center,
+        "shape": bgr.shape[:2],
+    }
+
+    return fixed_scene
+
+def detect_drone_only(
+    bgr,
+    depth=None,
+    fixed_scene=None,
+    return_debug=False,
+    previous_center=None,
+    previous_bgr=None,
+):
+    if fixed_scene is None:
+        raise ValueError("fixed_scene is required. Build it once with build_fixed_scene(...).")
+
+    h, w = bgr.shape[:2]
+    depth = resize_depth(depth, (h, w))
+    roi = make_floor_roi(bgr)
+
+    track_mask = resize_mask(fixed_scene.get("track_mask"), (h, w))
+    start_pad = resize_mask(fixed_scene.get("start_pad_mask"), (h, w))
+    landing_pad = resize_mask(fixed_scene.get("landing_pad_mask"), (h, w))
+
+    if previous_bgr is not None:
+        drone, drone_info, drone_debug = detect_drone_motion(
+            bgr,
+            previous_bgr,
+            roi,
+            track_mask,
+            landing_pad,
+            start_pad,
+            depth=depth,
+            previous_center=previous_center
+        )
+
+        if drone_info["drone_center"] is None:
+            led_drone, led_info, led_debug = detect_drone_led(
+                bgr,
+                roi,
+                track_mask,
+                landing_pad,
+                start_pad,
+                depth=depth,
+                previous_center=previous_center
+            )
+
+            drone = led_drone
+            drone_info = led_info
+            drone_debug.update(led_debug)
+    elif previous_center is None and fixed_scene.get("initial_drone_center") is not None:
+        initial_center = fixed_scene.get("initial_drone_center")
+        drone = point_mask((h, w), initial_center, radius=42)
+        drone_info = {
+            "drone_center": initial_center,
+            "drone_candidates": [],
+            "drone_method": "manual_initial",
+        }
+        drone_debug = {
+            "drone": drone,
+        }
+    else:
+        drone, drone_info, drone_debug = detect_drone_led(
+            bgr,
+            roi,
+            track_mask,
+            landing_pad,
+            start_pad,
+            depth=depth,
+            previous_center=previous_center
+        )
+
+    seg = np.zeros((h, w), dtype=np.uint8)
+    seg[track_mask] = TRACK
+    seg[start_pad] = START_PAD
+    seg[landing_pad] = LANDING_PAD
+    seg[drone] = DRONE
+
+    info = {
+        "start_pad_center": fixed_scene.get("start_pad_center"),
+        "landing_pad_center": fixed_scene.get("landing_pad_center"),
+        "drone_center": drone_info["drone_center"],
+        "path": fixed_scene.get("path") or [],
+        "track_mask": track_mask,
+        "start_pad_mask": start_pad,
+        "landing_pad_mask": landing_pad,
+        "drone_depth": sample_depth(depth, drone_info["drone_center"]),
+        "drone_candidates": drone_info["drone_candidates"],
+        "drone_method": drone_info.get("drone_method"),
+    }
+
+    if not return_debug:
+        return seg, info
+
+    debug = {
+        "track": track_mask,
+        "start_pad": start_pad,
+        "landing_pad": landing_pad,
         **drone_debug,
     }
 
@@ -550,7 +1083,7 @@ def normalize_depth_for_view(depth):
 
 def make_json_safe(value):
     if isinstance(value, dict):
-        return {k: make_json_safe(v) for k, v in value.items()}
+        return {k: make_json_safe(v) for k, v in value.items() if "mask" not in k}
 
     if isinstance(value, list):
         return [make_json_safe(v) for v in value]
@@ -612,12 +1145,3 @@ def save_results(rgb_path, depth_path=None, output_dir="track_detection_output")
 
     print(f"Saved results to: {output_dir}")
     print(json.dumps(make_json_safe(info), indent=2))
-
-if __name__ == "__main__":
-    test_pairs = [
-    ("frame_1779104513_rgb.png", "frame_1779104513_depth.npy"),
-    ]
-
-    for rgb_path, depth_path in test_pairs:
-        if Path(rgb_path).exists():
-            save_results(rgb_path, depth_path)
