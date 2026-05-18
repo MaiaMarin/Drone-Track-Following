@@ -8,15 +8,18 @@ BACKGROUND = 0
 START_PAD = 1
 LANDING_PAD = 2
 TRACK = 3
-DRONE = 4
 
 MASK_COLORS_BGR = np.array([
     [0, 0, 0],
     [0, 255, 0],
     [255, 255, 0],
     [0, 180, 255],
-    [255, 0, 255],
 ], dtype=np.uint8)
+
+CENTERLINE_RESAMPLE_STEP = 6.0
+CENTERLINE_SMOOTH_WINDOW = 7
+CENTERLINE_SIMPLIFY_EPSILON = 10.0
+
 
 def resize_depth(depth, shape):
     if depth is None:
@@ -29,6 +32,7 @@ def resize_depth(depth, shape):
 
     return cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
 
+
 def resize_mask(mask, shape):
     h, w = shape
 
@@ -39,6 +43,7 @@ def resize_mask(mask, shape):
         return mask.astype(bool)
 
     return cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
 
 def clean_mask(mask, open_k=3, close_k=7):
     mask = mask.astype(np.uint8)
@@ -52,6 +57,7 @@ def clean_mask(mask, open_k=3, close_k=7):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
 
     return mask.astype(bool)
+
 
 def connected_components(mask):
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
@@ -80,6 +86,7 @@ def connected_components(mask):
 
     return labels, comps
 
+
 def make_floor_roi(bgr):
     h, w = bgr.shape[:2]
     yy, xx = np.indices((h, w))
@@ -90,6 +97,7 @@ def make_floor_roi(bgr):
     roi &= xx < int(0.99 * w)
 
     return roi
+
 
 def point_mask(shape, center, radius=55):
     h, w = shape
@@ -108,57 +116,30 @@ def point_mask(shape, center, radius=55):
 
     return mask.astype(bool)
 
-def detect_landing_pad(bgr, roi):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    h, w = bgr.shape[:2]
 
-    hue, sat, val = cv2.split(hsv)
-    blue, green, red = cv2.split(bgr)
-    yy, xx = np.indices((h, w))
+def sample_depth(depth, point, radius=5):
+    if depth is None or point is None:
+        return None
 
-    mask = (
-        roi &
-        (xx < int(0.50 * w)) &
-        (hue >= 82) & (hue <= 110) &
-        (sat >= 45) &
-        (val >= 60) &
-        (blue.astype(np.int16) - red.astype(np.int16) > 25) &
-        (green.astype(np.int16) - red.astype(np.int16) > 15)
-    )
+    h, w = depth.shape[:2]
+    x = int(round(point[0]))
+    y = int(round(point[1]))
 
-    mask = clean_mask(mask, open_k=5, close_k=13)
+    x1 = max(0, x - radius)
+    x2 = min(w, x + radius + 1)
+    y1 = max(0, y - radius)
+    y2 = min(h, y + radius + 1)
 
-    labels, comps = connected_components(mask)
-    candidates = []
+    values = depth[y1:y2, x1:x2]
+    values = values[values > 0]
 
-    for comp in comps:
-        if comp["area"] < 250:
-            continue
-        if comp["area"] > 18000:
-            continue
-        if comp["w"] < 20 or comp["h"] < 15:
-            continue
-        if comp["w"] > 220 or comp["h"] > 160:
-            continue
-        if comp["fill"] < 0.15:
-            continue
+    if values.size == 0:
+        return None
 
-        score = comp["area"] * comp["fill"] + (1.0 - comp["cx"] / max(w, 1)) * 400
-        candidates.append((score, comp))
+    return float(np.median(values))
 
-    if not candidates:
-        empty = np.zeros((h, w), dtype=bool)
-        return empty, None, {"landing_raw": mask, "landing_pad": empty}
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best = candidates[0][1]
-
-    pad = labels == best["id"]
-    center = [best["cx"], best["cy"]]
-
-    return pad, center, {"landing_raw": mask, "landing_pad": pad}
-
-def detect_start_pad(bgr, roi):
+def detect_colored_pad_components(bgr, roi):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     h, w = bgr.shape[:2]
 
@@ -168,13 +149,11 @@ def detect_start_pad(bgr, roi):
 
     raw = (
         roi &
-        (xx > int(0.48 * w)) &
-        (yy > int(0.25 * h)) &
-        (hue >= 55) & (hue <= 110) &
-        (sat >= 12) & (sat <= 160) &
-        (val >= 45) &
-        (green.astype(np.int16) - red.astype(np.int16) > 0) &
-        (blue.astype(np.int16) - red.astype(np.int16) > -25)
+        (yy > int(0.20 * h)) &
+        (hue >= 55) & (hue <= 112) &
+        (sat >= 45) &
+        (val >= 55) &
+        (np.maximum(blue, green).astype(np.int16) - red.astype(np.int16) > 25)
     )
 
     raw = cv2.morphologyEx(
@@ -190,33 +169,75 @@ def detect_start_pad(bgr, roi):
     ).astype(bool)
 
     labels, comps = connected_components(raw)
+
+    filtered = []
+
+    for comp in comps:
+        if comp["area"] < 150:
+            continue
+        if comp["area"] > 22000:
+            continue
+        if comp["w"] < 15 or comp["h"] < 10:
+            continue
+        if comp["w"] > 260 or comp["h"] > 180:
+            continue
+        if comp["fill"] < 0.10:
+            continue
+
+        filtered.append(comp)
+
+    return raw, labels, filtered
+
+
+def detect_landing_pad(bgr, roi):
+    h, w = bgr.shape[:2]
+    raw, labels, comps = detect_colored_pad_components(bgr, roi)
+
     candidates = []
 
     for comp in comps:
-        if comp["area"] < 120:
+        if comp["cx"] > int(0.58 * w):
             continue
-        if comp["area"] > 18000:
-            continue
-        if comp["w"] > 240 or comp["h"] > 180:
-            continue
-        if comp["fill"] < 0.08:
+        if comp["cy"] < int(0.24 * h):
             continue
 
-        cx_norm = comp["cx"] / max(w, 1)
-        cy_norm = comp["cy"] / max(h, 1)
+        left_bonus = (1.0 - comp["cx"] / max(w, 1)) * 500
+        floor_bonus = (comp["cy"] / max(h, 1)) * 200
+        area_score = comp["area"] * comp["fill"]
+        score = area_score + left_bonus + floor_bonus
 
-        component_mask = labels == comp["id"]
-        mean_b = float(np.mean(blue[component_mask]))
-        mean_g = float(np.mean(green[component_mask]))
-        mean_r = float(np.mean(red[component_mask]))
+        candidates.append((score, comp))
 
-        greenish = mean_g - mean_r
-        right_bonus = cx_norm * 700
-        floor_bonus = cy_norm * 250
-        area_bonus = min(comp["area"], 3000) * 0.6
-        fill_bonus = comp["fill"] * 400
+    if not candidates:
+        empty = np.zeros((h, w), dtype=bool)
+        return empty, None, {"landing_raw": raw, "landing_pad": empty}
 
-        score = area_bonus + right_bonus + floor_bonus + fill_bonus + greenish * 8
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best = candidates[0][1]
+
+    pad = labels == best["id"]
+    center = [best["cx"], best["cy"]]
+
+    return pad, center, {"landing_raw": raw, "landing_pad": pad}
+
+
+def detect_start_pad(bgr, roi):
+    h, w = bgr.shape[:2]
+    raw, labels, comps = detect_colored_pad_components(bgr, roi)
+
+    candidates = []
+
+    for comp in comps:
+        if comp["cx"] < int(0.48 * w):
+            continue
+        if comp["cy"] < int(0.22 * h):
+            continue
+
+        right_bonus = (comp["cx"] / max(w, 1)) * 750
+        floor_bonus = (comp["cy"] / max(h, 1)) * 250
+        area_score = comp["area"] * comp["fill"]
+        score = area_score + right_bonus + floor_bonus
+
         candidates.append((score, comp))
 
     pad = np.zeros((h, w), dtype=np.uint8)
@@ -232,7 +253,28 @@ def detect_start_pad(bgr, roi):
 
     return pad, center, {"start_raw": raw, "start_pad": pad}
 
-def build_track_score(bgr, roi):
+
+def normalize_depth_for_view(depth):
+    if depth is None:
+        return None
+
+    d = depth.astype(np.float32)
+    valid = d > 0
+
+    if np.count_nonzero(valid) == 0:
+        return np.zeros(depth.shape, dtype=np.uint8)
+
+    lo = np.percentile(d[valid], 2)
+    hi = np.percentile(d[valid], 98)
+
+    if hi <= lo:
+        return np.zeros(depth.shape, dtype=np.uint8)
+
+    out = np.clip((d - lo) / (hi - lo), 0, 1)
+    return (out * 255).astype(np.uint8)
+
+
+def build_track_score(bgr, roi, depth=None):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -244,7 +286,7 @@ def build_track_score(bgr, roi):
     blur = cv2.GaussianBlur(lightness, (0, 0), 25)
     local_bright = lightness.astype(np.int16) - blur.astype(np.int16)
 
-    beige = (
+    track_color = (
         roi &
         (val >= 70) &
         (sat <= 130) &
@@ -262,22 +304,91 @@ def build_track_score(bgr, roi):
         iterations=1
     ).astype(bool)
 
+    depth_edges = np.zeros(gray.shape, dtype=bool)
+
+    if depth is not None:
+        depth_view = normalize_depth_for_view(depth)
+
+        if depth_view is not None:
+            depth_edges = cv2.Canny(depth_view, 35, 110)
+            depth_edges = cv2.dilate(
+                depth_edges,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=1
+            ).astype(bool)
+
     score = np.zeros(gray.shape, dtype=np.float32)
-    score += np.clip((local_bright - 1) / 24, 0, 1) * 0.50
-    score += beige.astype(np.float32) * 0.35
+    score += np.clip((local_bright - 1) / 24, 0, 1) * 0.45
+    score += track_color.astype(np.float32) * 0.35
     score += edges.astype(np.float32) * 0.15
+    score += depth_edges.astype(np.float32) * 0.05
     score *= roi.astype(np.float32)
+    score = np.clip(score, 0, 1)
+
+    candidate = (score > 0.28) & track_color
+
+    candidate = cv2.morphologyEx(
+        candidate.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    ).astype(bool)
+
+    candidate = cv2.dilate(
+        candidate.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+        iterations=1
+    ).astype(bool)
 
     debug = {
         "track_score": np.clip(score * 255, 0, 255).astype(np.uint8),
-        "track_beige": beige,
+        "track_color": track_color,
         "track_edges": edges,
+        "track_depth_edges": depth_edges,
+        "track_candidate": candidate,
         "track_local_bright": np.clip(local_bright + 128, 0, 255).astype(np.uint8),
     }
 
-    return score, debug
+    return score, candidate, debug
 
-def dijkstra_path(score, start_point, end_point):
+
+def snap_endpoint_to_track(score, candidate, point, other_point, radius=155):
+    if point is None:
+        return None
+
+    h, w = score.shape[:2]
+    yy, xx = np.indices((h, w))
+
+    point = np.array(point, dtype=np.float32)
+
+    if other_point is None:
+        other_point = point
+
+    other_point = np.array(other_point, dtype=np.float32)
+
+    d_point = np.hypot(xx - point[0], yy - point[1])
+    d_other = np.hypot(xx - other_point[0], yy - other_point[1])
+
+    mask = d_point <= radius
+    mask &= candidate | (score > 0.35)
+
+    ys, xs = np.where(mask)
+
+    if len(xs) == 0:
+        return [float(point[0]), float(point[1])]
+
+    values = (
+        score[ys, xs] * 1000.0 +
+        candidate[ys, xs].astype(np.float32) * 150.0 -
+        d_point[ys, xs] * 0.8 -
+        d_other[ys, xs] * 0.03
+    )
+
+    best = int(np.argmax(values))
+
+    return [float(xs[best]), float(ys[best])]
+
+
+def dijkstra_path(score, start_point, end_point, candidate_mask=None):
     h, w = score.shape[:2]
 
     if start_point is None or end_point is None:
@@ -290,8 +401,19 @@ def dijkstra_path(score, start_point, end_point):
 
     small_score = cv2.resize(score, (small_w, small_h), interpolation=cv2.INTER_AREA)
     small_score = cv2.GaussianBlur(small_score, (5, 5), 0)
+    small_score = np.clip(small_score, 0, 1)
 
-    cost = 1.0 + 80.0 * (1.0 - np.clip(small_score, 0, 1))
+    if candidate_mask is None:
+        small_candidate = np.ones((small_h, small_w), dtype=bool)
+    else:
+        small_candidate = cv2.resize(
+            candidate_mask.astype(np.uint8),
+            (small_w, small_h),
+            interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+
+    cost = 1.0 + 100.0 * (1.0 - small_score)
+    cost += (~small_candidate).astype(np.float32) * 350.0
 
     sx = int(np.clip(start_point[0] / scale, 0, small_w - 1))
     sy = int(np.clip(start_point[1] / scale, 0, small_h - 1))
@@ -370,6 +492,7 @@ def dijkstra_path(score, start_point, end_point):
 
     return path
 
+
 def path_to_mask(path, shape, thickness=40):
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -382,406 +505,242 @@ def path_to_mask(path, shape, thickness=40):
 
     return mask > 0
 
-def sample_depth(depth, point, radius=5):
-    if depth is None or point is None:
-        return None
 
-    h, w = depth.shape[:2]
-    x = int(round(point[0]))
-    y = int(round(point[1]))
+def path_as_array(path):
+    if path is None:
+        return np.empty((0, 2), dtype=np.float32)
 
-    x1 = max(0, x - radius)
-    x2 = min(w, x + radius + 1)
-    y1 = max(0, y - radius)
-    y2 = min(h, y + radius + 1)
+    arr = np.array(path, dtype=np.float32)
 
-    values = depth[y1:y2, x1:x2]
-    values = values[values > 0]
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        return np.empty((0, 2), dtype=np.float32)
 
-    if values.size == 0:
-        return None
+    cleaned = []
 
-    return float(np.median(values))
+    for p in arr:
+        if not cleaned:
+            cleaned.append(p)
+        elif np.linalg.norm(p - cleaned[-1]) >= 1.0:
+            cleaned.append(p)
 
-def make_search_mask(shape, center, radius):
-    h, w = shape
-    mask = np.zeros((h, w), dtype=np.uint8)
+    return np.array(cleaned, dtype=np.float32)
 
-    if center is None:
-        return mask.astype(bool)
 
-    x = int(round(center[0]))
-    y = int(round(center[1]))
-    x = int(np.clip(x, 0, w - 1))
-    y = int(np.clip(y, 0, h - 1))
+def point_distance(a, b):
+    if a is None or b is None:
+        return float("inf")
 
-    cv2.circle(mask, (x, y), radius, 1, -1)
+    return float(np.linalg.norm(np.array(a, dtype=np.float32) - np.array(b, dtype=np.float32)))
 
-    return mask.astype(bool)
 
-def detect_drone_led(bgr, roi, path_mask, landing_pad, start_pad, depth=None, previous_center=None):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+def orient_path_start_to_landing(path, start_center, landing_center):
+    arr = path_as_array(path)
 
-    h, w = bgr.shape[:2]
-    depth = resize_depth(depth, (h, w))
+    if len(arr) < 2:
+        return arr
 
-    _, sat, val = cv2.split(hsv)
-    blue, green, red = cv2.split(bgr)
+    if start_center is None or landing_center is None:
+        return arr
 
-    exclude_landing = cv2.dilate(
-        landing_pad.astype(np.uint8),
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (95, 95)),
-        iterations=1
-    ).astype(bool)
+    normal_score = point_distance(arr[0], start_center) + point_distance(arr[-1], landing_center)
+    reversed_score = point_distance(arr[-1], start_center) + point_distance(arr[0], landing_center)
 
-    exclude_start = cv2.dilate(
-        start_pad.astype(np.uint8),
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (95, 95)),
-        iterations=1
-    ).astype(bool)
+    if reversed_score < normal_score:
+        arr = arr[::-1].copy()
 
-    exclude = exclude_landing | exclude_start
-    allowed = roi & ~exclude
+    return arr
 
-    if previous_center is not None:
-        allowed &= make_search_mask((h, w), previous_center, 260)
 
-    white_led = (val >= 165) & (sat <= 180)
+def smooth_centerline(points, window=CENTERLINE_SMOOTH_WINDOW):
+    arr = path_as_array(points)
 
-    bluish_led = (
-        (blue >= 115) &
-        (green >= 90) &
-        (red >= 55) &
-        (val >= 115)
-    )
+    if len(arr) < 3 or window <= 1:
+        return arr
 
-    reddish_led = (
-        (red >= 120) &
-        (val >= 120) &
-        (sat >= 45) &
-        (blue < 140)
-    )
+    if window % 2 == 0:
+        window += 1
 
-    bright = allowed & (white_led | bluish_led | reddish_led)
+    if len(arr) < window:
+        return arr
 
-    labels, comps = connected_components(bright)
+    half = window // 2
+    out = []
 
-    distmap = None
-
-    if path_mask is not None and np.count_nonzero(path_mask) > 0:
-        inv = (~path_mask).astype(np.uint8) * 255
-        distmap = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
-
-    previous_distmap = None
-
-    if previous_center is not None:
-        prev_mask = make_search_mask((h, w), previous_center, 1).astype(np.uint8)
-        previous_distmap = cv2.distanceTransform((1 - prev_mask).astype(np.uint8), cv2.DIST_L2, 5)
-
-    scene_depth = None
-
-    if depth is not None:
-        valid_depth = depth[(depth > 0) & roi]
-
-        if valid_depth.size > 0:
-            scene_depth = float(np.median(valid_depth))
-
-    candidates = []
-
-    for comp in comps:
-        if comp["area"] < 3:
-            continue
-        if comp["area"] > 1600:
-            continue
-        if comp["w"] > 90 or comp["h"] > 90:
+    for i in range(len(arr)):
+        if i == 0 or i == len(arr) - 1:
+            out.append(arr[i])
             continue
 
-        cx = int(comp["cx"])
-        cy = int(comp["cy"])
+        a = max(0, i - half)
+        b = min(len(arr), i + half + 1)
+        out.append(np.mean(arr[a:b], axis=0))
 
-        r = 75
-        x1 = max(0, cx - r)
-        x2 = min(w, cx + r)
-        y1 = max(0, cy - r)
-        y2 = min(h, cy + r)
+    return np.array(out, dtype=np.float32)
 
-        local_gray = gray[y1:y2, x1:x2]
-        local_val = val[y1:y2, x1:x2]
 
-        dark_fraction = float(np.mean(local_gray < 90))
-        very_dark_fraction = float(np.mean(local_gray < 55))
-        bright_fraction = float(np.mean(local_val > 150))
-        brightness = float(np.mean(val[labels == comp["id"]]))
+def resample_centerline(points, step=CENTERLINE_RESAMPLE_STEP):
+    arr = path_as_array(points)
 
-        depth_score = 0.0
-        candidate_depth = sample_depth(depth, [cx, cy], radius=8)
+    if len(arr) < 2:
+        return arr
 
-        if scene_depth is not None and candidate_depth is not None:
-            closer_amount = scene_depth - candidate_depth
-            depth_score = float(np.clip(closer_amount / 700.0, 0.0, 1.0)) * 220.0
+    result = [arr[0].copy()]
+    carry = 0.0
+    previous = arr[0].copy()
 
-        score = 0.0
-        score += brightness * 1.15
-        score += dark_fraction * 260.0
-        score += very_dark_fraction * 240.0
-        score += bright_fraction * 80.0
-        score += depth_score
-        score += comp["area"] * 0.03
+    for i in range(1, len(arr)):
+        current = arr[i].copy()
+        segment = current - previous
+        length = float(np.linalg.norm(segment))
 
-        if distmap is not None:
-            score -= min(float(distmap[cy, cx]), 260.0) * 0.55
+        if length < 1e-6:
+            continue
 
-        if previous_distmap is not None:
-            score -= min(float(previous_distmap[cy, cx]), 260.0) * 0.85
+        direction = segment / length
+        remaining = length
 
-        if dark_fraction < 0.08:
-            score -= 180.0
+        while carry + remaining >= step:
+            need = step - carry
+            new_point = previous + direction * need
+            result.append(new_point.copy())
+            previous = new_point
+            remaining = float(np.linalg.norm(current - previous))
+            carry = 0.0
 
-        if candidate_depth is None and depth is not None:
-            score -= 40.0
+        carry += remaining
+        previous = current
 
-        comp["score"] = score
-        comp["dark_fraction"] = dark_fraction
-        comp["very_dark_fraction"] = very_dark_fraction
-        comp["bright_fraction"] = bright_fraction
-        comp["brightness"] = brightness
-        comp["depth"] = candidate_depth
-        comp["depth_score"] = depth_score
+    if np.linalg.norm(result[-1] - arr[-1]) > 1.0:
+        result.append(arr[-1].copy())
 
-        candidates.append(comp)
+    return np.array(result, dtype=np.float32)
 
-    candidates.sort(key=lambda c: c["score"], reverse=True)
 
-    drone_mask = np.zeros((h, w), dtype=np.uint8)
-    drone_center = None
+def simplify_centerline(points, epsilon=CENTERLINE_SIMPLIFY_EPSILON):
+    arr = path_as_array(points)
 
-    if candidates and candidates[0]["score"] > 210:
-        best = candidates[0]
-        drone_center = [best["cx"], best["cy"]]
-        cv2.circle(drone_mask, (int(best["cx"]), int(best["cy"])), 42, 1, -1)
+    if len(arr) < 3:
+        return arr
 
-    drone_mask = drone_mask.astype(bool)
+    contour = arr.reshape(-1, 1, 2).astype(np.float32)
+    approx = cv2.approxPolyDP(contour, epsilon, False).reshape(-1, 2).astype(np.float32)
 
-    debug = {
-        "drone_bright_candidates": bright,
-        "drone": drone_mask,
+    if len(approx) < 2:
+        return arr[[0, -1]]
+
+    if np.linalg.norm(approx[0] - arr[0]) > 1.0:
+        approx = np.vstack([arr[0], approx])
+
+    if np.linalg.norm(approx[-1] - arr[-1]) > 1.0:
+        approx = np.vstack([approx, arr[-1]])
+
+    cleaned = []
+
+    for p in approx:
+        if not cleaned:
+            cleaned.append(p)
+        elif np.linalg.norm(p - cleaned[-1]) >= 8.0:
+            cleaned.append(p)
+
+    if len(cleaned) < 2:
+        cleaned = [arr[0], arr[-1]]
+
+    return np.array(cleaned, dtype=np.float32)
+
+
+def sample_depths_along_centerline(depth, centerline, radius=5):
+    arr = path_as_array(centerline)
+
+    if depth is None or len(arr) == 0:
+        return [], 0.0
+
+    values = []
+
+    for p in arr:
+        values.append(sample_depth(depth, p, radius=radius))
+
+    valid = sum(v is not None for v in values)
+    ratio = float(valid / max(len(values), 1))
+
+    return values, ratio
+
+
+def centerline_lengths(centerline):
+    arr = path_as_array(centerline)
+
+    if len(arr) < 2:
+        return {
+            "centerline_length_px": 0.0,
+            "centerline_segment_lengths_px": [],
+        }
+
+    diffs = np.diff(arr, axis=0)
+    lengths = np.linalg.norm(diffs, axis=1)
+
+    return {
+        "centerline_length_px": float(np.sum(lengths)),
+        "centerline_segment_lengths_px": [float(x) for x in lengths],
     }
+
+
+def centerline_turn_angles(centerline):
+    arr = path_as_array(centerline)
+
+    if len(arr) < 3:
+        return []
+
+    angles = []
+
+    for i in range(1, len(arr) - 1):
+        p0 = np.array([arr[i - 1][0], -arr[i - 1][1]], dtype=np.float32)
+        p1 = np.array([arr[i][0], -arr[i][1]], dtype=np.float32)
+        p2 = np.array([arr[i + 1][0], -arr[i + 1][1]], dtype=np.float32)
+
+        v1 = p1 - p0
+        v2 = p2 - p1
+
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+
+        if n1 < 1e-6 or n2 < 1e-6:
+            angles.append(0.0)
+            continue
+
+        v1 = v1 / n1
+        v2 = v2 / n2
+
+        cross = float(v1[0] * v2[1] - v1[1] * v2[0])
+        dot = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
+        angles.append(float(np.degrees(np.arctan2(cross, dot))))
+
+    return angles
+
+
+def build_centerline_info(path, depth=None, start_center=None, landing_center=None):
+    raw_oriented = orient_path_start_to_landing(path, start_center, landing_center)
+    smoothed = smooth_centerline(raw_oriented)
+    resampled = resample_centerline(smoothed)
+    simplified = simplify_centerline(resampled)
+
+    depth_values, depth_valid_ratio = sample_depths_along_centerline(depth, resampled)
 
     info = {
-        "drone_center": drone_center,
-        "drone_candidates": candidates[:5],
-        "drone_method": "led",
+        "centerline_raw": raw_oriented.tolist(),
+        "centerline_smoothed": smoothed.tolist(),
+        "centerline": resampled.tolist(),
+        "centerline_simplified": simplified.tolist(),
+        "centerline_depths": depth_values,
+        "centerline_depth_valid_ratio": float(depth_valid_ratio),
+        "centerline_turn_angles": centerline_turn_angles(resampled),
+        "centerline_simplified_turn_angles": centerline_turn_angles(simplified),
+        "centerline_point_count": int(len(resampled)),
+        "centerline_simplified_point_count": int(len(simplified)),
     }
 
-    return drone_mask, info, debug
+    info.update(centerline_lengths(resampled))
 
-def detect_drone_motion(
-    bgr,
-    previous_bgr,
-    roi,
-    path_mask,
-    landing_pad,
-    start_pad,
-    depth=None,
-    previous_center=None,
-):
-    h, w = bgr.shape[:2]
-    depth = resize_depth(depth, (h, w))
+    return info
 
-    if previous_bgr is None:
-        empty = np.zeros((h, w), dtype=bool)
-        info = {
-            "drone_center": None,
-            "drone_candidates": [],
-            "drone_method": "motion_unavailable",
-        }
-        debug = {
-            "drone_motion_raw": empty,
-            "drone_motion_clean": empty,
-            "drone": empty,
-        }
-        return empty, info, debug
-
-    if previous_bgr.shape[:2] != (h, w):
-        previous_bgr = cv2.resize(previous_bgr, (w, h), interpolation=cv2.INTER_AREA)
-
-    current_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    previous_gray = cv2.cvtColor(previous_bgr, cv2.COLOR_BGR2GRAY)
-
-    current_gray = cv2.GaussianBlur(current_gray, (7, 7), 0)
-    previous_gray = cv2.GaussianBlur(previous_gray, (7, 7), 0)
-
-    gray_diff = cv2.absdiff(current_gray, previous_gray)
-
-    color_diff = cv2.absdiff(bgr, previous_bgr)
-    color_diff = np.max(color_diff, axis=2)
-
-    motion_raw = ((gray_diff > 18) | (color_diff > 32))
-
-    allowed = roi.copy()
-
-    if previous_center is not None:
-        allowed &= make_search_mask((h, w), previous_center, 260)
-
-    near_path = np.zeros((h, w), dtype=bool)
-
-    if path_mask is not None and np.count_nonzero(path_mask) > 0:
-        near_path = cv2.dilate(
-            path_mask.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (231, 231)),
-            iterations=1
-        ).astype(bool)
-
-    if previous_center is None and np.count_nonzero(near_path) > 0:
-        allowed &= near_path
-
-    if previous_center is not None and np.count_nonzero(near_path) > 0:
-        allowed &= (near_path | make_search_mask((h, w), previous_center, 260))
-
-    motion = motion_raw & allowed
-
-    motion = cv2.morphologyEx(
-        motion.astype(np.uint8),
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    )
-
-    motion = cv2.morphologyEx(
-        motion,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    )
-
-    motion = cv2.dilate(
-        motion,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
-        iterations=1
-    ).astype(bool)
-
-    labels, comps = connected_components(motion)
-
-    distmap = None
-
-    if path_mask is not None and np.count_nonzero(path_mask) > 0:
-        inv = (~path_mask).astype(np.uint8) * 255
-        distmap = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
-
-    previous_distmap = None
-
-    if previous_center is not None:
-        prev_mask = make_search_mask((h, w), previous_center, 1).astype(np.uint8)
-        previous_distmap = cv2.distanceTransform((1 - prev_mask).astype(np.uint8), cv2.DIST_L2, 5)
-
-    scene_depth = None
-
-    if depth is not None:
-        valid_depth = depth[(depth > 0) & roi]
-
-        if valid_depth.size > 0:
-            scene_depth = float(np.median(valid_depth))
-
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    _, _, val = cv2.split(hsv)
-
-    candidates = []
-
-    for comp in comps:
-        if comp["area"] < 20:
-            continue
-        if comp["area"] > 14000:
-            continue
-        if comp["w"] > 220 or comp["h"] > 220:
-            continue
-
-        cx = int(comp["cx"])
-        cy = int(comp["cy"])
-
-        component_mask = labels == comp["id"]
-
-        x1 = max(0, comp["x"])
-        x2 = min(w, comp["x"] + comp["w"])
-        y1 = max(0, comp["y"])
-        y2 = min(h, comp["y"] + comp["h"])
-
-        local_gray = gray[y1:y2, x1:x2]
-        local_val = val[y1:y2, x1:x2]
-        local_motion = gray_diff[y1:y2, x1:x2]
-
-        dark_fraction = float(np.mean(local_gray < 95))
-        very_dark_fraction = float(np.mean(local_gray < 55))
-        bright_fraction = float(np.mean(local_val > 150))
-        motion_energy = float(np.mean(local_motion[motion[y1:y2, x1:x2]])) if np.any(motion[y1:y2, x1:x2]) else 0.0
-
-        depth_score = 0.0
-        candidate_depth = sample_depth(depth, [cx, cy], radius=8)
-
-        if scene_depth is not None and candidate_depth is not None:
-            closer_amount = scene_depth - candidate_depth
-            depth_score = float(np.clip(closer_amount / 700.0, 0.0, 1.0)) * 180.0
-
-        score = 0.0
-        score += min(comp["area"], 2500) * 0.06
-        score += motion_energy * 2.0
-        score += dark_fraction * 180.0
-        score += very_dark_fraction * 220.0
-        score += bright_fraction * 50.0
-        score += depth_score
-
-        if distmap is not None:
-            score -= min(float(distmap[cy, cx]), 260.0) * 0.30
-
-        if previous_distmap is not None:
-            score -= min(float(previous_distmap[cy, cx]), 300.0) * 0.75
-
-        if previous_center is not None:
-            d_prev = float(np.hypot(cx - previous_center[0], cy - previous_center[1]))
-            if d_prev > 260:
-                score -= 300.0
-
-        if comp["fill"] < 0.04:
-            score -= 70.0
-
-        if candidate_depth is None and depth is not None:
-            score -= 30.0
-
-        comp["score"] = score
-        comp["dark_fraction"] = dark_fraction
-        comp["very_dark_fraction"] = very_dark_fraction
-        comp["bright_fraction"] = bright_fraction
-        comp["motion_energy"] = motion_energy
-        comp["depth"] = candidate_depth
-        comp["depth_score"] = depth_score
-
-        candidates.append(comp)
-
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-
-    drone_mask = np.zeros((h, w), dtype=np.uint8)
-    drone_center = None
-
-    if candidates and candidates[0]["score"] > 85:
-        best = candidates[0]
-        drone_center = [best["cx"], best["cy"]]
-        radius = int(np.clip(max(best["w"], best["h"]) * 0.75, 28, 55))
-        cv2.circle(drone_mask, (int(best["cx"]), int(best["cy"])), radius, 1, -1)
-
-    drone_mask = drone_mask.astype(bool)
-
-    debug = {
-        "drone_motion_raw": motion_raw,
-        "drone_motion_clean": motion,
-        "drone": drone_mask,
-    }
-
-    info = {
-        "drone_center": drone_center,
-        "drone_candidates": candidates[:5],
-        "drone_method": "motion",
-    }
-
-    return drone_mask, info, debug
 
 def segment_scene(bgr, depth=None, return_debug=False):
     h, w = bgr.shape[:2]
@@ -792,39 +751,53 @@ def segment_scene(bgr, depth=None, return_debug=False):
     landing_pad, landing_center, landing_debug = detect_landing_pad(bgr, roi)
     start_pad, start_center, start_debug = detect_start_pad(bgr, roi)
 
-    track_score, track_debug = build_track_score(bgr, roi)
+    track_score, track_candidate, track_debug = build_track_score(bgr, roi, depth=depth)
 
-    path = dijkstra_path(track_score, landing_center, start_center)
-    track = path_to_mask(path, (h, w), thickness=max(24, int(round(min(h, w) * 0.055))))
+    start_track_point = snap_endpoint_to_track(track_score, track_candidate, start_center, landing_center, radius=155)
+    landing_track_point = snap_endpoint_to_track(track_score, track_candidate, landing_center, start_center, radius=155)
 
-    drone, drone_info, drone_debug = detect_drone_led(
-        bgr,
-        roi,
-        track,
-        landing_pad,
-        start_pad,
-        depth=depth
+    raw_path = dijkstra_path(
+        track_score,
+        start_track_point,
+        landing_track_point,
+        candidate_mask=track_candidate
+    )
+
+    track = path_to_mask(
+        raw_path,
+        (h, w),
+        thickness=max(24, int(round(min(h, w) * 0.055)))
+    )
+
+    centerline_info = build_centerline_info(
+        raw_path,
+        depth=depth,
+        start_center=start_center,
+        landing_center=landing_center
     )
 
     seg = np.zeros((h, w), dtype=np.uint8)
     seg[track] = TRACK
     seg[start_pad] = START_PAD
     seg[landing_pad] = LANDING_PAD
-    seg[drone] = DRONE
 
     info = {
         "start_pad_center": start_center,
         "landing_pad_center": landing_center,
-        "drone_center": drone_info["drone_center"],
-        "path": path,
+        "end_pad_center": landing_center,
+        "path": raw_path,
         "track_mask": track,
+        "track_candidate_mask": track_candidate,
         "start_pad_mask": start_pad,
         "landing_pad_mask": landing_pad,
+        "end_pad_mask": landing_pad,
+        "start_track_point": start_track_point,
+        "landing_track_point": landing_track_point,
+        "end_track_point": landing_track_point,
         "start_depth": sample_depth(depth, start_center),
         "landing_depth": sample_depth(depth, landing_center),
-        "drone_depth": sample_depth(depth, drone_info["drone_center"]),
-        "drone_candidates": drone_info["drone_candidates"],
-        "drone_method": drone_info.get("drone_method"),
+        "end_depth": sample_depth(depth, landing_center),
+        **centerline_info,
     }
 
     if not return_debug:
@@ -836,43 +809,40 @@ def segment_scene(bgr, depth=None, return_debug=False):
         **start_debug,
         **track_debug,
         "track": track,
-        **drone_debug,
     }
 
     return seg, info, debug
 
+
 def build_fixed_scene(bgr, depth=None):
     seg, info = segment_scene(bgr, depth, return_debug=False)
 
-    path = info.get("path") or []
-    track_mask = info.get("track_mask")
-
-    if track_mask is None:
-        track_mask = path_to_mask(
-            path,
-            bgr.shape[:2],
-            thickness=max(24, int(round(min(bgr.shape[:2]) * 0.055)))
-        )
-
     fixed_scene = {
-        "path": path,
-        "track_mask": track_mask,
+        "path": info.get("path") or [],
+        "centerline": info.get("centerline") or [],
+        "centerline_raw": info.get("centerline_raw") or [],
+        "centerline_smoothed": info.get("centerline_smoothed") or [],
+        "centerline_simplified": info.get("centerline_simplified") or [],
+        "centerline_depths": info.get("centerline_depths") or [],
+        "centerline_depth_valid_ratio": info.get("centerline_depth_valid_ratio"),
+        "track_mask": info.get("track_mask"),
         "start_pad_center": info.get("start_pad_center"),
         "landing_pad_center": info.get("landing_pad_center"),
+        "end_pad_center": info.get("end_pad_center"),
         "start_pad_mask": info.get("start_pad_mask"),
         "landing_pad_mask": info.get("landing_pad_mask"),
-        "initial_drone_center": info.get("drone_center"),
+        "end_pad_mask": info.get("end_pad_mask"),
         "shape": bgr.shape[:2],
     }
 
     return fixed_scene
+
 
 def build_fixed_scene_from_points(
     bgr,
     depth=None,
     start_center=None,
     landing_center=None,
-    initial_drone_center=None,
     start_radius=55,
     landing_radius=55,
 ):
@@ -885,147 +855,59 @@ def build_fixed_scene_from_points(
     start_center = [float(start_center[0]), float(start_center[1])]
     landing_center = [float(landing_center[0]), float(landing_center[1])]
 
-    if initial_drone_center is not None:
-        initial_drone_center = [float(initial_drone_center[0]), float(initial_drone_center[1])]
-
     roi = make_floor_roi(bgr)
-    track_score, _ = build_track_score(bgr, roi)
+    track_score, track_candidate, _ = build_track_score(bgr, roi, depth=depth)
 
-    path = dijkstra_path(track_score, landing_center, start_center)
+    start_track_point = snap_endpoint_to_track(track_score, track_candidate, start_center, landing_center, radius=155)
+    landing_track_point = snap_endpoint_to_track(track_score, track_candidate, landing_center, start_center, radius=155)
+
+    raw_path = dijkstra_path(
+        track_score,
+        start_track_point,
+        landing_track_point,
+        candidate_mask=track_candidate
+    )
 
     track_mask = path_to_mask(
-        path,
+        raw_path,
         (h, w),
         thickness=max(24, int(round(min(h, w) * 0.055)))
+    )
+
+    centerline_info = build_centerline_info(
+        raw_path,
+        depth=depth,
+        start_center=start_center,
+        landing_center=landing_center
     )
 
     start_pad_mask = point_mask((h, w), start_center, radius=start_radius)
     landing_pad_mask = point_mask((h, w), landing_center, radius=landing_radius)
 
-    if initial_drone_center is None:
-        _, drone_info, _ = detect_drone_led(
-            bgr,
-            roi,
-            track_mask,
-            landing_pad_mask,
-            start_pad_mask,
-            depth=depth
-        )
-        initial_drone_center = drone_info["drone_center"]
-
     fixed_scene = {
-        "path": path,
+        "path": raw_path,
+        "centerline": centerline_info.get("centerline") or [],
+        "centerline_raw": centerline_info.get("centerline_raw") or [],
+        "centerline_smoothed": centerline_info.get("centerline_smoothed") or [],
+        "centerline_simplified": centerline_info.get("centerline_simplified") or [],
+        "centerline_depths": centerline_info.get("centerline_depths") or [],
+        "centerline_depth_valid_ratio": centerline_info.get("centerline_depth_valid_ratio"),
         "track_mask": track_mask,
         "start_pad_center": start_center,
         "landing_pad_center": landing_center,
+        "end_pad_center": landing_center,
         "start_pad_mask": start_pad_mask,
         "landing_pad_mask": landing_pad_mask,
-        "initial_drone_center": initial_drone_center,
+        "end_pad_mask": landing_pad_mask,
         "shape": bgr.shape[:2],
     }
 
     return fixed_scene
 
-def detect_drone_only(
-    bgr,
-    depth=None,
-    fixed_scene=None,
-    return_debug=False,
-    previous_center=None,
-    previous_bgr=None,
-):
-    if fixed_scene is None:
-        raise ValueError("fixed_scene is required. Build it once with build_fixed_scene(...).")
-
-    h, w = bgr.shape[:2]
-    depth = resize_depth(depth, (h, w))
-    roi = make_floor_roi(bgr)
-
-    track_mask = resize_mask(fixed_scene.get("track_mask"), (h, w))
-    start_pad = resize_mask(fixed_scene.get("start_pad_mask"), (h, w))
-    landing_pad = resize_mask(fixed_scene.get("landing_pad_mask"), (h, w))
-
-    if previous_bgr is not None:
-        drone, drone_info, drone_debug = detect_drone_motion(
-            bgr,
-            previous_bgr,
-            roi,
-            track_mask,
-            landing_pad,
-            start_pad,
-            depth=depth,
-            previous_center=previous_center
-        )
-
-        if drone_info["drone_center"] is None:
-            led_drone, led_info, led_debug = detect_drone_led(
-                bgr,
-                roi,
-                track_mask,
-                landing_pad,
-                start_pad,
-                depth=depth,
-                previous_center=previous_center
-            )
-
-            drone = led_drone
-            drone_info = led_info
-            drone_debug.update(led_debug)
-    elif previous_center is None and fixed_scene.get("initial_drone_center") is not None:
-        initial_center = fixed_scene.get("initial_drone_center")
-        drone = point_mask((h, w), initial_center, radius=42)
-        drone_info = {
-            "drone_center": initial_center,
-            "drone_candidates": [],
-            "drone_method": "manual_initial",
-        }
-        drone_debug = {
-            "drone": drone,
-        }
-    else:
-        drone, drone_info, drone_debug = detect_drone_led(
-            bgr,
-            roi,
-            track_mask,
-            landing_pad,
-            start_pad,
-            depth=depth,
-            previous_center=previous_center
-        )
-
-    seg = np.zeros((h, w), dtype=np.uint8)
-    seg[track_mask] = TRACK
-    seg[start_pad] = START_PAD
-    seg[landing_pad] = LANDING_PAD
-    seg[drone] = DRONE
-
-    info = {
-        "start_pad_center": fixed_scene.get("start_pad_center"),
-        "landing_pad_center": fixed_scene.get("landing_pad_center"),
-        "drone_center": drone_info["drone_center"],
-        "path": fixed_scene.get("path") or [],
-        "track_mask": track_mask,
-        "start_pad_mask": start_pad,
-        "landing_pad_mask": landing_pad,
-        "drone_depth": sample_depth(depth, drone_info["drone_center"]),
-        "drone_candidates": drone_info["drone_candidates"],
-        "drone_method": drone_info.get("drone_method"),
-    }
-
-    if not return_debug:
-        return seg, info
-
-    debug = {
-        "track": track_mask,
-        "start_pad": start_pad,
-        "landing_pad": landing_pad,
-        **drone_debug,
-    }
-
-    return seg, info, debug
 
 def colorize_mask(seg):
     return MASK_COLORS_BGR[seg]
+
 
 def overlay_mask(bgr, seg, alpha=0.45):
     color = colorize_mask(seg)
@@ -1035,18 +917,18 @@ def overlay_mask(bgr, seg, alpha=0.45):
     overlay[visible] = blended[visible]
     return overlay
 
+
 def draw_points_and_path(bgr, info):
     out = bgr.copy()
 
-    path = info.get("path") or []
+    path = info.get("centerline") or info.get("path") or []
 
     if len(path) >= 2:
         points = np.array(path, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(out, [points], False, (0, 180, 255), 4, lineType=cv2.LINE_AA)
+        cv2.polylines(out, [points], False, (0, 0, 255), 3, lineType=cv2.LINE_AA)
 
     start = info.get("start_pad_center")
     landing = info.get("landing_pad_center")
-    drone = info.get("drone_center")
 
     if start is not None:
         cv2.circle(out, (int(start[0]), int(start[1])), 10, (0, 255, 0), -1)
@@ -1054,32 +936,98 @@ def draw_points_and_path(bgr, info):
 
     if landing is not None:
         cv2.circle(out, (int(landing[0]), int(landing[1])), 10, (255, 255, 0), -1)
-        cv2.putText(out, "LAND", (int(landing[0]) + 12, int(landing[1]) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-    if drone is not None:
-        cv2.circle(out, (int(drone[0]), int(drone[1])), 10, (255, 0, 255), -1)
-        cv2.putText(out, "DRONE", (int(drone[0]) + 12, int(drone[1]) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        cv2.putText(out, "END", (int(landing[0]) + 12, int(landing[1]) - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
     return out
 
-def normalize_depth_for_view(depth):
-    if depth is None:
-        return None
 
-    d = depth.astype(np.float32)
-    valid = d > 0
+def draw_final_detection(bgr, info):
+    out = bgr.copy()
 
-    if np.count_nonzero(valid) == 0:
-        return np.zeros(depth.shape, dtype=np.uint8)
+    seg_overlay = np.zeros_like(out)
 
-    lo = np.percentile(d[valid], 2)
-    hi = np.percentile(d[valid], 98)
+    track_mask = info.get("track_mask")
+    start_pad = info.get("start_pad_mask")
+    landing_pad = info.get("landing_pad_mask")
 
-    if hi <= lo:
-        return np.zeros(depth.shape, dtype=np.uint8)
+    if track_mask is not None:
+        seg_overlay[track_mask.astype(bool)] = (0, 180, 255)
 
-    out = np.clip((d - lo) / (hi - lo), 0, 1)
-    return (out * 255).astype(np.uint8)
+    if start_pad is not None:
+        seg_overlay[start_pad.astype(bool)] = (0, 255, 0)
+
+    if landing_pad is not None:
+        seg_overlay[landing_pad.astype(bool)] = (255, 255, 0)
+
+    visible = np.any(seg_overlay > 0, axis=2)
+    blended = cv2.addWeighted(out, 0.70, seg_overlay, 0.30, 0)
+    out[visible] = blended[visible]
+
+    centerline = info.get("centerline") or info.get("path") or []
+
+    if len(centerline) >= 2:
+        pts = np.array(centerline, dtype=np.int32).reshape(-1, 1, 2)
+
+        cv2.polylines(out, [pts], False, (0, 0, 255), 1, lineType=cv2.LINE_AA)
+
+        for p in pts[::18]:
+            x, y = p[0]
+            cv2.circle(out, (int(x), int(y)), 1, (0, 0, 255), -1)
+
+    start = info.get("start_pad_center")
+    landing = info.get("landing_pad_center")
+
+    if start is not None:
+        cv2.circle(out, (int(start[0]), int(start[1])), 11, (0, 255, 0), -1)
+        cv2.putText(
+            out,
+            "START",
+            (int(start[0]) + 12, int(start[1]) - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2
+        )
+
+    if landing is not None:
+        cv2.circle(out, (int(landing[0]), int(landing[1])), 11, (255, 255, 0), -1)
+        cv2.putText(
+            out,
+            "END",
+            (int(landing[0]) + 12, int(landing[1]) - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 0),
+            2
+        )
+
+    length_px = info.get("centerline_length_px")
+    depth_ratio = info.get("centerline_depth_valid_ratio")
+
+    if length_px is not None:
+        cv2.putText(
+            out,
+            f"centerline px: {length_px:.1f}",
+            (12, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2
+        )
+
+    if depth_ratio is not None:
+        cv2.putText(
+            out,
+            f"depth valid: {depth_ratio:.2f}",
+            (12, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2
+        )
+
+    return out
+
 
 def make_json_safe(value):
     if isinstance(value, dict):
@@ -1102,7 +1050,8 @@ def make_json_safe(value):
 
     return value
 
-def save_results(rgb_path, depth_path=None, output_dir="track_detection_output"):
+
+def save_results(rgb_path, depth_path=None, output_dir="track_detection_output", show=False):
     rgb_path = Path(rgb_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1123,25 +1072,40 @@ def save_results(rgb_path, depth_path=None, output_dir="track_detection_output")
     seg, info, debug = segment_scene(bgr, depth, return_debug=True)
 
     stem = rgb_path.stem
+    final_overlay = draw_final_detection(bgr, info)
 
-    np.save(output_dir / f"{stem}_segmentation.npy", seg)
-    cv2.imwrite(str(output_dir / f"{stem}_segmentation_raw.png"), seg)
-    cv2.imwrite(str(output_dir / f"{stem}_segmentation_vis.png"), colorize_mask(seg))
-    cv2.imwrite(str(output_dir / f"{stem}_overlay.png"), overlay_mask(bgr, seg))
-    cv2.imwrite(str(output_dir / f"{stem}_path_overlay.png"), draw_points_and_path(bgr, info))
+    final_path = output_dir / f"{stem}_final_detection.png"
+    metadata_path = output_dir / f"{stem}_metadata.json"
 
-    if depth is not None:
-        depth_view = normalize_depth_for_view(resize_depth(depth, bgr.shape[:2]))
-        cv2.imwrite(str(output_dir / f"{stem}_depth_view.png"), depth_view)
+    cv2.imwrite(str(final_path), final_overlay)
 
-    for name, mask in debug.items():
-        if mask.dtype == bool:
-            cv2.imwrite(str(output_dir / f"{stem}_{name}.png"), mask.astype(np.uint8) * 255)
-        else:
-            cv2.imwrite(str(output_dir / f"{stem}_{name}.png"), mask)
-
-    with open(output_dir / f"{stem}_metadata.json", "w", encoding="utf-8") as f:
+    with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(make_json_safe(info), f, indent=2)
 
-    print(f"Saved results to: {output_dir}")
-    print(json.dumps(make_json_safe(info), indent=2))
+    print("Saved final detection:", final_path)
+    print("Saved metadata:", metadata_path)
+    print("start:", info.get("start_pad_center"))
+    print("end:", info.get("landing_pad_center"))
+    print("start track point:", info.get("start_track_point"))
+    print("end track point:", info.get("landing_track_point"))
+    print("centerline points:", info.get("centerline_point_count"))
+    print("centerline length px:", round(info.get("centerline_length_px", 0), 2))
+    print("depth valid ratio:", round(info.get("centerline_depth_valid_ratio", 0), 2))
+
+    if show:
+        cv2.namedWindow("Track detection", cv2.WINDOW_NORMAL)
+        cv2.imshow("Track detection", final_overlay)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    return seg, info
+
+# test on frame I had in my pc
+# if __name__ == "__main__":
+#     test_rgb = Path("frame_1779104513_rgb.png")
+#     test_depth = Path("frame_1779104513_depth.npy")
+
+#     if test_rgb.exists():
+#         save_results(test_rgb, test_depth if test_depth.exists() else None, show=True)
+#     else:
+#         print(f"Test frame not found: {test_rgb}")
