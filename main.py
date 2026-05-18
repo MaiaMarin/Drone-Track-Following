@@ -1,89 +1,149 @@
+import time
 import cv2
-from vision import (
-    detect_track_mask,
-    skeletonize_mask,
-    get_skeleton_points,
-    get_path_directions,
-    get_follow_direction_from_position,
-    draw_skeleton,
-    draw_path_directions,
-    draw_follow_direction,
-)
-from drone_controller import direction_to_command, DroneController
+import math
+from camera_module import RealsenseCamera
+from perception_module import DepthTrackPlanner 
+from control_module import FlightController
+from radar_module import FlightRadar  
+from codrone_edu.drone import *
 
-IMAGE_PATH = "track.jpeg"
-DRONE_POSITION = (430, 560)
+def main():
+    print("🔌 Connecting to Robolink Drone...")
+    drone = Drone()
+    drone.pair() 
+    print("✅ Drone Paired!")
 
-img = cv2.imread(IMAGE_PATH)
-
-if img is None:
-    print("Could not load image.")
-    exit(1)
-
-mask = detect_track_mask(img)
-skeleton = skeletonize_mask(mask)
-points = get_skeleton_points(skeleton, max_jump=30)
-
-follow_direction = get_follow_direction_from_position(
-    DRONE_POSITION,
-    points,
-    lookahead_distance=120
-)
-
-if follow_direction is None:
-    print("No follow direction found.")
-    directions = []
-    commands = []
-    nearest_index = None
-    path_from_drone = []
-else:
-    nearest_index = follow_direction["nearest_index"]
-    path_from_drone = points[nearest_index:]
-
-    directions = get_path_directions(
-        path_from_drone,
-        step=80,
-        lookahead_distance=100
-    )
-
-    commands = [direction_to_command(direction) for direction in directions]
-
-if len(commands) > 0:
-    controller = DroneController()
+    cam = RealsenseCamera()
+    perception = DepthTrackPlanner()
+    controller = FlightController(hover_height_offset=0.45) 
+    radar = FlightRadar()             
+    
+    state = "WAITING" 
+    takeoff_start_time = 0.0
+    print("System armed. State: WAITING. Press space to draw path.")
 
     try:
-        controller.connect()
-        controller.takeoff()
-        controller.follow_commands(commands)
-        controller.land()
-    except BaseException as e:
-        print("Drone flight failed:", e)
+        while True:
+            color_img, depth_frame = cam.get_frames()
+            if color_img is None or depth_frame is None: continue
+                
+            data, debug_img = perception.process_frames(color_img, depth_frame)
+            center_depth = depth_frame.get_distance(320, 240) 
+            
+            # --- STATE MACHINE MANAGEMENT ---
+            if state == "WAITING":
+                # Step 1: Once path drawing is finished, take off and wait safely
+                if data["path_ready"]:
+                    print("🚀 Path locked. Performing initial safe liftoff...")
+                    drone.takeoff() 
+                    takeoff_start_time = time.time()
+                    state = "TAKEOFF_HOLD"
+                    
+            elif state == "TAKEOFF_HOLD":
+                # Keep drone strictly locked in position while it climbs
+                drone.set_roll(0)
+                drone.set_pitch(0)
+                drone.set_throttle(0)
+                drone.move()
+                
+                elapsed = time.time() - takeoff_start_time
+                print(f"⏱️ Establishing safe baseline hover... ({elapsed:.1f}s / 2.5s)", end="\r")
+                
+                # After 2.5 seconds, lock it into a permanent hover state until you click it
+                if elapsed >= 2.5:
+                    print("\n🛑 Hover locked! WAITING FOR SELECTION. Click the drone on screen to begin track sequence.")
+                    state = "WAITING_FOR_CLICK"
+                    
+            elif state == "WAITING_FOR_CLICK":
+                # Absolutely no horizontal or vertical movement allowed here. Just hover in place.
+                drone.set_roll(0)
+                drone.set_pitch(0)
+                drone.set_throttle(0)
+                drone.move()
+                
+                # The exact moment you manual left-click the drone on the screen, transition to flight!
+                if data["tracking_active"] and data["drone_3d"] is not None:
+                    print("\n🔒 Selection detected! Tracking active. Aligning with track heading...")
+                    
+                    waypoints = data["waypoints"]
+                    if len(waypoints) > 5:
+                        controller.set_track_alignment(waypoints[0], waypoints[5])
+                    else:
+                        controller.set_track_alignment(waypoints[0], waypoints[-1])
+                        
+                    state = "FLYING"
+                    
+            elif state == "FLYING":
+                waypoints = data["waypoints"]
+                drone_pos = data["drone_3d"]
+                
+                if len(waypoints) > 0:
+                    if drone_pos is not None:
+                        
+                        # Lookahead queue trimmer
+                        while len(waypoints) > 0:
+                            dist = math.sqrt((waypoints[0][0] - drone_pos[0])**2 + (waypoints[0][2] - drone_pos[2])**2)
+                            if dist < 0.22:
+                                waypoints.pop(0)
+                            else:
+                                break
+                        
+                        if len(waypoints) > 0:
+                            target_wp = waypoints[0]
+                            roll, pitch, throttle = controller.calculate_velocities(drone_pos, target_wp)
+                            
+                            # Safe, smooth speed constraints
+                            rb_roll = int(max(-18, min(roll * 100, 18)))
+                            rb_pitch = int(max(-18, min(pitch * 100, 18)))
+                            rb_throttle = int(max(-30, min(throttle * 100, 30)))
+                            
+                            drone.set_roll(rb_roll)
+                            drone.set_pitch(rb_pitch)
+                            drone.set_throttle(rb_throttle)
+                            drone.move() 
+                        else:
+                            state = "LANDING"
+                    else:
+                        # Hold position safely if tracking drops out
+                        drone.set_roll(0)
+                        drone.set_pitch(0)
+                        drone.set_throttle(0)
+                        drone.move()
+                else:
+                    state = "LANDING"
+                    
+            elif state == "LANDING":
+                print("🏁 Track complete. Executing landing sequence...")
+                drone.set_roll(0)
+                drone.set_pitch(0)
+                drone.set_throttle(0)
+                drone.land()
+                state = "DONE"
+                    
+            elif state == "DONE":
+                break
+            
+            radar_img = radar.draw_dashboard(data, state, center_depth)
+            cv2.imshow("Flight Control Dashboard", radar_img)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): 
+                print("🛑 EMERGENCY STOP ACTIVATED")
+                drone.emergency_stop() 
+                break
+            elif key == ord(' '): 
+                if state == "WAITING": 
+                    perception.toggle_drawing()
+            
+            time.sleep(0.03) 
+            
+    except KeyboardInterrupt:
+        print("🛑 Manual override triggered. Landing...")
+        drone.land()
     finally:
-        try:
-            controller.close()
-        except BaseException:
-            pass
-else:
-    print("No commands generated, skipping flight.")
+        cv2.destroyAllWindows()
+        cam.stop()
+        drone.close() 
 
-print("skeleton points:", len(points))
-print("nearest index:", nearest_index)
-print("path points from drone:", len(path_from_drone))
-print("directions:", len(directions))
-print("commands:")
-for i, command in enumerate(commands, start=1):
-    print(i, command)
-
-debug = draw_skeleton(img, skeleton)
-debug = draw_path_directions(debug, directions)
-
-if follow_direction is not None:
-    debug = draw_follow_direction(debug, DRONE_POSITION, follow_direction)
-
-cv2.imshow("original", img)
-cv2.imshow("track mask", mask)
-cv2.imshow("skeleton", skeleton)
-cv2.imshow("debug follow", debug)
-
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
